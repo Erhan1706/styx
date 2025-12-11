@@ -1,4 +1,5 @@
 from typing import Any
+import time
 
 from .message_types import MessageType
 from .tcp_networking import NetworkingManager
@@ -100,6 +101,7 @@ class Operator(BaseOperator):
         logging.info(f'ack_payload: {ack_payload} RQ_ID: {request_id} TID: {t_id} '
                      f'function: {self.name}:{function_name} fallback mode: {fallback_mode}')
         success: bool = True
+        start_time = time.time()
         if ack_payload is not None:
             # part of a chain (not root)
             ack_host, ack_port, ack_id, fraction_str, chain_participants, partial_node_count = ack_payload
@@ -127,6 +129,9 @@ class Operator(BaseOperator):
                 success = False
             else:
                 self.__networking.add_response(t_id, resp)
+        end_time = time.time()
+        duration_ms = (end_time - start_time) * 1000
+        protocol.record_operator_call(self.name, partition, function_name, duration_ms, success)
         del f
         return success
 

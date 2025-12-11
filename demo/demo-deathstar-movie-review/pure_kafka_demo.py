@@ -23,7 +23,10 @@ from workload_data import movie_titles, charset
 import kafka_output_consumer
 import calculate_metrics
 
-SAVE_DIR: str = sys.argv[1]
+import os
+from datetime import datetime
+from export_metadata import save_metadata
+
 threads = int(sys.argv[2])
 N_PARTITIONS = int(sys.argv[3])
 messages_per_second = int(sys.argv[4])
@@ -31,9 +34,14 @@ sleeps_per_second = 100
 sleep_time = 0.0085
 seconds = int(sys.argv[5])
 warmup_seconds = int(sys.argv[6])
+epoch_size = int(sys.argv[7])
 STYX_HOST: str = 'localhost'
 STYX_PORT: int = 8886
 KAFKA_URL = 'localhost:9092'
+current_time = datetime.now().strftime("%m%d_%H%M")
+SAVE_DIR: str = f"{sys.argv[1]}/dmr{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
 
 g = StateflowGraph('deathstar_movie_review', operator_state_backend=LocalStateBackend.DICT)
 ####################################################################################################################
@@ -194,7 +202,10 @@ def main():
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('fork')
+
+    start_time = time.time()
     main()
+    end_time = time.time()
 
     print()
     kafka_output_consumer.main(SAVE_DIR)
@@ -206,3 +217,5 @@ if __name__ == "__main__":
         warmup_seconds,
         threads
     )
+
+    save_metadata("dmr", start_time, end_time, SAVE_DIR, N_PARTITIONS, messages_per_second, 2000, seconds, epoch_size)

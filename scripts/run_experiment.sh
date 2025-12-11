@@ -18,20 +18,25 @@ sleep 10
 if [[ $workload_name == "ycsbt" ]]; then
     # YCSB-T
     run_with_validation=true
-    python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation"
+    python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size"
+elif [[ $workload_name == "inc_ycsbt" ]]; then
+    # Incremental YCSB-T
+    run_with_validation=true
+    python demo/demo-ycsb/inc_client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size"
 elif [[ $workload_name == "dhr" ]]; then
     # Deathstar Hotel Reservation
-    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds"
+    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size"
 elif [[ $workload_name == "dmr" ]]; then
     # Deathstar Movie Review
-    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds"
+    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size"
 elif [[ $workload_name == "tpcc" ]]; then
     # TPC-C
     bash scripts/generate_tpcc_dataset.sh "$n_keys"
-    python demo/demo-tpc-c/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$n_keys"
+    python demo/demo-tpc-c/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$n_keys" "$epoch_size"
 else
     echo "Benchmark not supported!"
 fi
 
 
-bash scripts/stop_styx_cluster.sh
+#bash scripts/stop_styx_cluster.sh
+docker compose stop coordinator worker 

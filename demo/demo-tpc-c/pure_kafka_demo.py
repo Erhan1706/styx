@@ -25,8 +25,10 @@ import rand
 
 import kafka_output_consumer
 import calculate_metrics
+import os
+from datetime import datetime
+from export_metadata import save_metadata
 
-SAVE_DIR: str = sys.argv[1]
 threads = int(sys.argv[2])
 N_PARTITIONS = int(sys.argv[3])
 messages_per_second = int(sys.argv[4])
@@ -38,6 +40,12 @@ STYX_PORT: int = 8886
 KAFKA_URL = 'localhost:9092'
 warmup_seconds = int(sys.argv[6])
 N_W = int(sys.argv[7])
+epoch_size = int(sys.argv[8])
+current_time = datetime.now().strftime("%m%d_%H%M")
+SAVE_DIR: str = f"{sys.argv[1]}/tpcc_{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
+
 C_Per_District = 3000
 D_Per_Warehouse = 10
 N_D = N_W * D_Per_Warehouse
@@ -603,7 +611,9 @@ def main():
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('fork')
+    start_time = time.time()
     main()
+    end_time = time.time()
 
     print()
     kafka_output_consumer.main(SAVE_DIR)
@@ -616,3 +626,5 @@ if __name__ == "__main__":
         threads,
         N_W
     )
+
+    save_metadata("tpcc", start_time, end_time, SAVE_DIR, N_PARTITIONS, messages_per_second * threads, N_W, seconds, epoch_size)

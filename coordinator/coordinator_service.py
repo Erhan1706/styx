@@ -105,7 +105,53 @@ class CoordinatorService(object):
         self.heartbeat_gauge = Gauge("time_since_last_heartbeat",
                                             "Time Since Last Heartbeat",
                                             ["instance"])
-
+        self.backpressure_gauge = Gauge("worker_backpressure",
+                                        "Backpressure on the worker",
+                                        ["instance"])
+        self.queue_backlog_gauge = Gauge("queue_backlog",
+                                        "Backlog in the worker queue",
+                                        ["instance"])
+        self.idle_time_ms_per_second_gauge = Gauge("idle_time_ms_per_second",
+                                        "Idle time ms per second",
+                                        ["instance"])
+        
+        # Transaction count metrics
+        self.epoch_total_txns_gauge = Gauge("epoch_total_transactions",
+                                            "Total transactions in epoch",
+                                            ["instance"])
+        self.epoch_committed_txns_gauge = Gauge("epoch_committed_transactions",
+                                                "Committed transactions in epoch",
+                                                ["instance"])
+        self.epoch_logic_aborts_gauge = Gauge("epoch_logic_aborts",
+                                              "Logic/global aborts in epoch",
+                                              ["instance"])
+        self.epoch_concurrency_aborts_gauge = Gauge("epoch_concurrency_aborts",
+                                                    "Concurrency aborts in epoch",
+                                                    ["instance"])
+        self.epoch_committed_lock_free_gauge = Gauge("epoch_committed_lock_free",
+                                                     "Transactions committed in lock-free phase",
+                                                     ["instance"])
+        self.epoch_committed_fallback_gauge = Gauge("epoch_committed_fallback",
+                                                    "Transactions committed in fallback phase",
+                                                    ["instance"])
+        # Metrics for downscaling policies
+        self.empty_epoch_gauge = Gauge("worker_empty_epoch",
+                                       "1 if epoch had no local work (just sync), 0 otherwise",
+                                       ["instance"])
+        self.utilization_gauge = Gauge("worker_utilization",
+                                       "Ratio of processing time to total time (0.0-1.0)",
+                                       ["instance"])
+        # Operator-level performance metrics
+        self.operator_tps_gauge = Gauge("operator_tps",
+                                        "Transactions per second per operator partition",
+                                        ["instance", "operator", "partition"])
+        self.operator_call_count_gauge = Gauge("operator_call_count",
+                                                      "Number of calls to an operator partition",
+                                                      ["instance", "operator", "partition"])
+        self.operator_latency_gauge = Gauge("operator_latency_ms",
+                                            "Average operator call latency in ms for this epoch",
+                                            ["instance", "operator", "partition"])
+        
     # Refactoring candidate
     async def coordinator_controller(self, transport, data, pool: concurrent.futures.ProcessPoolExecutor):
         message_type: int = self.networking.get_msg_type(data)
@@ -198,7 +244,13 @@ class CoordinatorService(object):
                     (worker_id, epoch_throughput, epoch_latency,
                      local_abort_rate, wal_time, func_time, chain_ack_time,
                      sync_time, conflict_res_time, commit_time,
-                     fallback_time, snap_time) = self.protocol_networking.decode_message(data)
+                     fallback_time, snap_time, sequencer_backpressure, 
+                     queue_backlog, idle_time_ms,
+                     total_txns, committed_txns, logic_aborts, 
+                     concurrency_aborts, committed_lock_free,
+                     committed_fallback, empty_epoch, utilization,
+                     operator_epoch_stats) = self.protocol_networking.decode_message(data)
+                    
                     self.epoch_throughput_gauge.labels(instance=worker_id).set(epoch_throughput)
                     self.epoch_latency_gauge.labels(instance=worker_id).set(epoch_latency)
                     self.epoch_abort_gauge.labels(instance=worker_id).set(local_abort_rate)
@@ -210,7 +262,31 @@ class CoordinatorService(object):
                     self.latency_breakdown_gauge.labels(instance=worker_id, component="Commit time").set(commit_time)
                     self.latency_breakdown_gauge.labels(instance=worker_id, component="Fallback").set(fallback_time)
                     self.latency_breakdown_gauge.labels(instance=worker_id, component="Async Snapshot").set(snap_time)
-
+                    self.backpressure_gauge.labels(instance=worker_id).set(sequencer_backpressure)
+                    self.queue_backlog_gauge.labels(instance=worker_id).set(queue_backlog)
+                    self.idle_time_ms_per_second_gauge.labels(instance=worker_id).set(idle_time_ms)
+                    # Transaction count metrics
+                    self.epoch_total_txns_gauge.labels(instance=worker_id).set(total_txns)
+                    self.epoch_committed_txns_gauge.labels(instance=worker_id).set(committed_txns)
+                    self.epoch_logic_aborts_gauge.labels(instance=worker_id).set(logic_aborts)
+                    self.epoch_concurrency_aborts_gauge.labels(instance=worker_id).set(concurrency_aborts)
+                    self.epoch_committed_lock_free_gauge.labels(instance=worker_id).set(committed_lock_free)
+                    self.epoch_committed_fallback_gauge.labels(instance=worker_id).set(committed_fallback)
+                    # Downscaling metrics
+                    self.empty_epoch_gauge.labels(instance=worker_id).set(1 if empty_epoch else 0)
+                    self.utilization_gauge.labels(instance=worker_id).set(utilization)
+                    # Operator-level metrics for this worker and epoch
+                    print(f"Worker {worker_id}, received operator epoch stats: {operator_epoch_stats}")
+                    for op_name, partition, tps, avg_latency_ms, call_count in operator_epoch_stats:
+                        labels = {
+                            "instance": worker_id,
+                            "operator": op_name,
+                            "partition": str(partition)
+                        }
+                        self.operator_tps_gauge.labels(**labels).set(tps)
+                        self.operator_call_count_gauge.labels(**labels).set(call_count)
+                        self.operator_latency_gauge.labels(**labels).set(avg_latency_ms)
+                    
                 sync_complete: bool = await self.aria_metadata.set_empty_sync_done()
                 if sync_complete:
                     await self.finalize_worker_sync(MessageType(message_type),

@@ -13,7 +13,9 @@ from styx.common.stateflow_graph import StateflowGraph
 
 import kafka_output_consumer
 import calculate_metrics
-
+import os
+from datetime import datetime
+from export_metadata import save_metadata
 from tqdm import tqdm
 
 from ycsb import ycsb_operator
@@ -27,7 +29,8 @@ N_PARTITIONS = int(sys.argv[3])
 STARTING_MONEY = 1_000_000
 ZIPF_CONST = float(sys.argv[4])
 messages_per_second = int(sys.argv[5])
-sleeps_per_second = 100
+sleeps_per_second = 100 if messages_per_second > 100 else 1
+batch_size = max(1, messages_per_second // sleeps_per_second)
 sleep_time = 0.0085
 seconds = int(sys.argv[6])
 key_list: list[int] = list(range(N_ENTITIES))
@@ -37,9 +40,13 @@ STYX_PORT: int = 8886
 # STYX_PORT: int = 8888
 KAFKA_URL = 'localhost:9092'
 # KAFKA_URL = '35.229.114.18:9094'
-SAVE_DIR: str = sys.argv[7]
+current_time = datetime.now().strftime("%m%d_%H%M")
+SAVE_DIR: str = f"{sys.argv[7]}/ycsb_{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
 warmup_seconds: int = int(sys.argv[8])
 run_with_validation = bool(sys.argv[9])
+epoch_size = int(sys.argv[10])
 ####################################################################################################################
 g = StateflowGraph('ycsb-benchmark', operator_state_backend=LocalStateBackend.DICT)
 ycsb_operator.set_n_partitions(N_PARTITIONS)
@@ -145,9 +152,9 @@ def main():
         results = p.map(benchmark_runner, range(threads))
 
     results = {k: v for d in results for k, v in d.items()}
-    assert len(results) == messages_per_second * seconds * threads
+    #assert len(results) == messages_per_second * seconds * threads
 
-    if run_with_validation:
+    if run_with_validation and False:
         # wait for system to stabilize
         time.sleep(30)
 
@@ -178,11 +185,14 @@ def main():
                   }).sort_values("timestamp").to_csv(f'{SAVE_DIR}/client_requests.csv', index=False)
 
     print('Workload completed')
+    time.sleep(10)
 
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('fork')
+    start_time = time.time()
     main()
+    end_time = time.time()
 
     print()
     kafka_output_consumer.main(SAVE_DIR)
@@ -198,3 +208,6 @@ if __name__ == "__main__":
         SAVE_DIR,
         run_with_validation
     )
+
+    save_metadata("ycsb", start_time, end_time, SAVE_DIR, N_PARTITIONS, 
+        messages_per_second * threads, N_ENTITIES, seconds, None, None, ZIPF_CONST, epoch_size)

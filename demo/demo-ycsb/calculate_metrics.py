@@ -89,6 +89,7 @@ def main(
     req_ids = output_msgs['request_id']
     dup = output_msgs[req_ids.isin(req_ids[req_ids.duplicated()])].sort_values("request_id")
 
+    print(f" Output messages: {output_msgs.head()}")
 
     res_dict = {
         "duplicate_requests": duplicate_requests,
@@ -159,6 +160,7 @@ def main(
     print(f'Done. Persisted metrics in {save_dir}/{exp_name}.json')
     with open(f'{save_dir}/{exp_name}.json', 'w', encoding='utf-8') as f:
         json.dump(res_dict, f, ensure_ascii=False, indent=4)
+    return are_we_consistent
 
 
 if __name__ == '__main__':

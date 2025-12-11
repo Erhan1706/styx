@@ -6,6 +6,7 @@ from timeit import default_timer as timer
 
 from aiokafka import TopicPartition
 from msgspec import msgpack
+from collections import defaultdict
 
 from styx.common.logging import logging
 from styx.common.message_types import MessageType
@@ -148,6 +149,26 @@ class AriaProtocol(BaseTransactionalProtocol):
         self.started = asyncio.Event()
         self.wait_responses_to_be_sent = asyncio.Event()
 
+        # Idle time tracking for downscaling policies
+        # Tracks time between epochs (waiting for work)
+        self._last_epoch_end_time: float = 0.0  # Timestamp when last epoch ended
+        self._idle_time_ms: float = 0.0  # Idle time in ms for current epoch
+        # Track epochs with no local work (forced to sync by coordinator)
+        self._empty_epoch: bool = False  # True if current epoch had no local sequence
+        # Processing time tracking for utilization calculation
+        self._processing_time_ms: float = 0.0  # Time spent in actual function execution
+        
+        self.operator_metrics = {}
+
+    def record_operator_call(self, operator_name, partition, function_name, duration_ms, success: bool):
+        key = (operator_name, partition, function_name)
+        m = self.operator_metrics.setdefault(key, {"count": 0, "failures": 0, "sum_ms": 0.0})
+        m["count"] += 1
+        m["sum_ms"] += duration_ms
+        if not success:
+            m["failures"] += 1
+        
+
     async def stop(self):
         await self.ingress.stop()
         await self.egress.stop()
@@ -162,9 +183,21 @@ class AriaProtocol(BaseTransactionalProtocol):
         logging.info(f"Active tasks: {asyncio.all_tasks()}")
         logging.warning("Aria protocol stopped")
 
+    def _task_exception_handler(self, task: asyncio.Task):
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # This will log the full traceback
+            import traceback
+            logging.error(f"Task {task.get_name()} crashed: {e}\n{traceback.format_exc()}")
+
     def start(self):
         self.function_scheduler_task = asyncio.create_task(self.function_scheduler())
+        self.function_scheduler_task.add_done_callback(self._task_exception_handler)
         self.communication_task = asyncio.create_task(self.communication_protocol())
+        self.communication_task.add_done_callback(self._task_exception_handler)
         logging.warning(f"Aria protocol started with operator partitions: {list(self.registered_operators.keys())}")
         self.snapshot_timer = timer()
 
@@ -327,8 +360,21 @@ class AriaProtocol(BaseTransactionalProtocol):
                 await asyncio.sleep(0)
                 async with self.sequencer.lock:
                     # GET SEQUENCE
-                    sequence: list[SequencedItem] = self.sequencer.get_epoch()
+                    sequence: list[SequencedItem] = self.sequencer.get_epoch()                    
                     if sequence or self.remote_wants_to_proceed:
+                        # Calculate idle time: time spent waiting since last epoch ended
+                        idle_end = timer()
+                        idle_start = self._last_epoch_end_time if self._last_epoch_end_time else idle_end
+                        self._idle_time_ms = (idle_end - idle_start) * 1000  # Convert to ms
+                        
+                        # Track if this is an empty epoch (no local work, just sync)
+                        # This is important for downscaling - distinguishes between:
+                        # - Worker being busy with actual transactions
+                        # - Worker being kept alive just for coordination
+                        self._empty_epoch = not bool(sequence)
+                        
+                        logging.warning(f"Idle time: {self._idle_time_ms:.2f}ms, "
+                                       f"empty_epoch: {self._empty_epoch}")
                         self.currently_processing = True
                         logging.info(f'{self.id} ||| Epoch: {self.sequencer.epoch_counter} starts')
                         # Run all the epochs functions concurrently
@@ -365,6 +411,8 @@ class AriaProtocol(BaseTransactionalProtocol):
                             end_chain = timer()
 
                         start_sync = timer()
+                        # Capture LOCAL logic aborts before sync overwrites with global
+                        logic_aborts_count = len(self.networking.logic_aborts_everywhere)
                         # wait for all peers to be done processing (needed to know the aborts)
                         await self.sync_workers(msg_type=MessageType.AriaProcessingDone,
                                                 message=(self.networking.logic_aborts_everywhere, ),
@@ -428,6 +476,13 @@ class AriaProtocol(BaseTransactionalProtocol):
 
                         logging.info(f'{self.id} ||| Sequence committed!')
 
+                        # Track lock-free vs fallback commits
+                        # Count LOCAL transactions that are in the GLOBAL aborts set
+                        local_aborted_t_ids = {seq_i.t_id for seq_i in sequence 
+                                               if seq_i.t_id in self.concurrency_aborts_everywhere}
+                        committed_lock_free = len(sequence) - len(local_aborted_t_ids)
+                        committed_fallback = 0
+
                         start_fallback = timer()
                         abort_rate: float = len(self.concurrency_aborts_everywhere) / self.total_processed_seq_size
 
@@ -437,15 +492,21 @@ class AriaProtocol(BaseTransactionalProtocol):
                                 f'{self.id} ||| Epoch: {self.sequencer.epoch_counter} '
                                 f'Abort percentage: {int(abort_rate * 100)}% initiating fallback strategy...\n'
                             )
+                            # Transactions to commit in fallback = concurrency aborts minus logic aborts
+                            local_aborted_t_ids = self.sequencer.get_aborted_sequence(self.t_ids_to_reschedule)
+                            committed_fallback = len(local_aborted_t_ids)
 
                             await self.run_fallback_strategy()
                             self.concurrency_aborts_everywhere = set()
                             concurrency_aborts = set()
                             self.t_ids_to_reschedule = set()
                         end_fallback = timer()
+
+                        partition_reqs = defaultdict(int)
                         for sequenced_item in sequence:
                             if sequenced_item.t_id not in self.concurrency_aborts_everywhere:
                                 payload = sequenced_item.payload
+                                partition_reqs[f"{payload.operator_name} {payload.partition}"] += 1
                                 tpo_key = (payload.operator_name, payload.kafka_ingress_partition)
                                 if tpo_key in self.topic_partition_offsets:
                                     self.topic_partition_offsets[tpo_key] = (
@@ -457,6 +518,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                                 else:
                                     self.topic_partition_offsets[tpo_key] = payload.kafka_offset
 
+                        logging.warning(f"Partition requests: {partition_reqs}")
                         self.sequencer.increment_epoch(
                             self.max_t_counter,
                             self.t_ids_to_reschedule
@@ -469,27 +531,93 @@ class AriaProtocol(BaseTransactionalProtocol):
                         epoch_end = timer()
                         epoch_latency = max(round((epoch_end - epoch_start) * 1000, 4), 1)
                         epoch_throughput = ((len(sequence) - len(concurrency_aborts)) * 1000) // epoch_latency # TPS
+                        
+                        # Calculate amount of records in Kafka that have not yet been consumer by the sequencer in all partitions
+                        tp_list = [TopicPartition(topic, partition) for (topic, partition) in self.topic_partition_offsets.keys()]
+                        end_offsets: dict[TopicPartition, int] = await self.ingress.kafka_consumer.end_offsets(tp_list)
+                        lag_partitions: dict[TopicPartition, int] = {}
+                        for tp, partition in self.topic_partition_offsets.keys():
+                            next_offset = self.topic_partition_offsets[(tp, partition)] + 1
+                            lag_partitions[TopicPartition(tp, partition)] = max(0, end_offsets[TopicPartition(tp, partition)] - next_offset)
+                        total_lag = sum(lag_partitions.values())
+                        #logging.warning(f"Lag partitions: {lag_partitions} and end offsets: {end_offsets}")
+                        logging.warning(f"Total lag: {total_lag}")
+
                         logging.info(
                             f'{self.id} ||| Epoch: {self.sequencer.epoch_counter - 1} done in '
                             f'{epoch_latency}ms '
                             f'global logic aborts: {len(self.networking.logic_aborts_everywhere)} '
                             f'concurrency aborts for next epoch: {len(self.concurrency_aborts_everywhere)} '
-                            f'abort rate: {abort_rate}'
+                            f'abort rate: {abort_rate} '
+                            f'sequencer backlog: {len(self.sequencer.distributed_log)} '
+                            f'total lag: {total_lag}'
                         )
+                        # Transaction count metrics for this epoch
+                        total_txns = len(sequence)
+                        committed_txns = len(sequence) - len(concurrency_aborts)
+                        concurrency_aborts_count = len(concurrency_aborts)
+                        
+                        # Calculate processing time for this epoch (actual work time)
+                        # This includes: function execution, chain acks, and fallback
+                        func_time_ms = round((end_func - start_func) * 1000, 4)
+                        chain_time_ms = round((end_chain - start_chain) * 1000, 4)
+                        fallback_time_ms = round((end_fallback - start_fallback) * 1000, 4)
+                        self._processing_time_ms = func_time_ms + chain_time_ms + fallback_time_ms
+                        
+                        # utilization: ratio of processing time to total time
+                        total_time_ms = self._idle_time_ms + epoch_latency
+                        utilization = (self._processing_time_ms / total_time_ms) if total_time_ms > 0 else 0.0
+
+                        operator_agg: dict[tuple[str, int], dict[str, float | int]] = {}
+                        for (op_name, partition, _func_name), m in self.operator_metrics.items():
+                            key = (op_name, partition)
+                            agg = operator_agg.setdefault(key, {"calls": 0, "sum_ms": 0.0})
+                            agg["calls"] += m["count"]
+                            agg["sum_ms"] += m["sum_ms"]
+
+                        operator_epoch_stats: list[tuple[str, int, float, float, int]] = []
+                        epoch_seconds = max(epoch_latency / 1000.0, 1e-6)
+                        for (op_name, partition), agg in operator_agg.items():
+                            call_count = int(agg["calls"])
+                            if call_count == 0:
+                                continue
+                            total_latency_ms = float(agg["sum_ms"])
+                            avg_latency_ms = total_latency_ms / call_count
+                            tps = call_count / epoch_seconds
+                            operator_epoch_stats.append(
+                                (op_name, partition, tps, avg_latency_ms, call_count)
+                            )
+                        # Reset per-epoch operator metrics after epoch
+                        self.operator_metrics.clear()
+                        
                         await self.sync_workers(msg_type=MessageType.SyncCleanup,
                                                 message=(self.id,
                                                          epoch_throughput,
                                                          epoch_latency,
                                                          local_abort_rate,
                                                          round((end_wal - start_wal) * 1000, 4),
-                                                         round((end_func - start_func) * 1000, 4),
-                                                         round((end_chain - start_chain) * 1000, 4),
+                                                         func_time_ms,
+                                                         chain_time_ms,
                                                          round(sync_time * 1000, 4),
                                                          round((conflict_resolution_end - conflict_resolution_start) * 1000, 4),
                                                          round((end_commit - start_commit) * 1000, 4),
-                                                         round((end_fallback - start_fallback) * 1000, 4),
-                                                         round((snap_end - snap_start) * 1000, 4)),
+                                                         fallback_time_ms,
+                                                         round((snap_end - snap_start) * 1000, 4),
+                                                         len(self.sequencer.distributed_log) + len(self.sequencer.current_epoch),
+                                                         total_lag,
+                                                         round(self._idle_time_ms, 4),
+                                                         total_txns,
+                                                         committed_txns,
+                                                         logic_aborts_count,
+                                                         concurrency_aborts_count,
+                                                         committed_lock_free,
+                                                         committed_fallback,
+                                                         self._empty_epoch,
+                                                         round(utilization, 4),
+                                                         operator_epoch_stats),
                                                 serializer=Serializer.MSGPACK)
+                        # Mark the end of this epoch for idle time tracking
+                        self._last_epoch_end_time = timer()
 
     def cleanup_after_epoch(self):
         self.concurrency_aborts_everywhere.clear()
