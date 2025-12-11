@@ -1,0 +1,14 @@
+{
+  "workload": "ycsb",
+  "messages_per_second": 2000,
+  "n_partitions": 4,
+  "n_keys": 100000,
+  "start": "2025-12-10T22:41:05.787855",
+  "end": "2025-12-10T22:45:44.061764",
+  "duration (s)": 240,
+  "zipf_const": 0.0,
+  "epoch_size": 2000,
+  "increase_interval": 15,
+  "increase_amount": 500,
+  "n_threads": 1
+}

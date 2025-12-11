@@ -1,0 +1,11 @@
+{
+  "workload": "dhr",
+  "messages_per_second": 10000,
+  "n_partitions": 4,
+  "n_keys": 2000,
+  "start": "2025-11-26T23:20:52.728214",
+  "end": "2025-11-26T23:23:18.136364",
+  "duration (s)": 60,
+  "zipf_const": 0,
+  "cpu_usage": 0.5
+}

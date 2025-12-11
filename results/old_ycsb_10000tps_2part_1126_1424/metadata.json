@@ -1,0 +1,10 @@
+{
+  "workload": "ycsb",
+  "messages_per_second": 10000,
+  "n_partitions": 2,
+  "n_keys": 100000,
+  "start": "2025-11-26T14:24:03.771312",
+  "end": "2025-11-26T14:36:40.586526",
+  "duration (s)": 600,
+  "zipf_const": 0.0
+}

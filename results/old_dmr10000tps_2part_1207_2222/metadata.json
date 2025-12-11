@@ -1,0 +1,9 @@
+{
+  "workload": "dmr",
+  "messages_per_second": 10000,
+  "n_partitions": 2,
+  "n_keys": 2000,
+  "start": "2025-12-07T22:22:49.259749",
+  "end": "2025-12-07T22:39:51.581066",
+  "duration (s)": 180
+}

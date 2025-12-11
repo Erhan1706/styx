@@ -1,0 +1,10 @@
+{
+  "workload": "dhr",
+  "messages_per_second": 10000,
+  "n_partitions": 4,
+  "n_keys": 2000,
+  "start": "2025-11-26T23:10:43.780337",
+  "end": "2025-11-26T23:13:01.490896",
+  "duration (s)": 60,
+  "zipf_const": 0
+}

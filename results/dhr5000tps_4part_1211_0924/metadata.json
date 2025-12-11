@@ -1,0 +1,10 @@
+{
+  "workload": "dhr",
+  "messages_per_second": 5000,
+  "n_partitions": 4,
+  "n_keys": 2000,
+  "start": "2025-12-11T09:24:39.518541",
+  "end": "2025-12-11T09:31:03.184177",
+  "duration (s)": 300,
+  "epoch_size": 1000
+}
