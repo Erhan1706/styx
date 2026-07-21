@@ -820,7 +820,7 @@ class Worker:
             f"MIGRATION | Replaying {len(buffered)} AsyncMigration batch(es) buffered during protocol restart",
         )
         for message in buffered:
-            await self.function_execution_protocol._handle_async_migration(message)
+            await self.function_execution_protocol.handle_async_migration(message)
 
     async def _handle_migration_done(self, data: bytes, _: MessageType) -> None:
         (

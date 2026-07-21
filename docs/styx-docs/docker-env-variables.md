@@ -107,6 +107,17 @@ These variables tune socket buffers, socket pooling, and worker queue backpressu
 | `CONTROL_QUEUE_SIZE` | `10000` | Maximum number of queued control-plane messages per worker. |
 | `PROTOCOL_WORKERS` | `100` | Number of concurrent protocol queue workers handling protocol-plane messages. |
 
+
+### Autoscaling 
+
+These variables select and configure the behaviour of the autoscaling policy that drives predictive autoscaling. They only matter when `ENABLE_AUTOSCALE` is true.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHRONOS_FORECAST_INTERVAL` | `2.0` | Seconds between forecast iterations |
+| `MIN_CHRONOS_PREDICTION_HORIZON` | `10` | Minimum forecast horizon in seconds, regardless of the estimated migration time. |
+| `MIGRATION_COLD_START_HORIZON_SEC` | `30` | Migration-duration estimate (Chronos forecast horizon) used only before the first migration has been measured; afterwards the coordinator learns an empirical per-moved-key rate. |
+
 ## Notes
 
 `Protocols.Aria` is currently hardcoded and is not configured through an

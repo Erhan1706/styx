@@ -80,6 +80,8 @@ _k8s_setup() {
     export STYX_PORT=8888
     export KAFKA_URL="${RELEASE_NAME}-kafka-headless:9092"
     export S3_ENDPOINT="http://${RELEASE_NAME}-rustfs:9000"
+    export COORDINATOR_METRICS_URL="http://${RELEASE_NAME}-styx-coordinator:8000/metrics"
+    export PROMETHEUS_URL="http://${RELEASE_NAME}-prometheus:9090"
 }
 
 if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; then
@@ -88,6 +90,8 @@ if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; th
 
 else
     # docker-compose mode
+    export COORDINATOR_METRICS_URL="${COORDINATOR_METRICS_URL:-http://localhost:8000/metrics}"
+    export PROMETHEUS_URL="${PROMETHEUS_URL:-http://localhost:9090}"
     bash scripts/start_styx_cluster.sh "$n_part" "$epoch_size" "$styx_threads_per_worker" "$enable_compression" "$use_composite_keys" "$autoscaling_enabled"
 
     # Wait for at least one worker to register with the coordinator
@@ -95,7 +99,7 @@ else
     max_wait=120
     waited=0
     while true; do
-        worker_count=$(curl -s http://localhost:8000/metrics 2>/dev/null | grep -E '^live_worker_count ' | awk '{print $2}' | cut -d. -f1 || true)
+        worker_count=$(curl -s "$COORDINATOR_METRICS_URL" 2>/dev/null | grep -E '^live_worker_count ' | awk '{print $2}' | cut -d. -f1 || true)
         if [[ -n "$worker_count" && "$worker_count" -ge 1 ]]; then
             echo "Workers ready: $worker_count worker(s) registered"
             break

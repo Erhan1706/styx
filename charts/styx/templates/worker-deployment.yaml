@@ -155,6 +155,10 @@ spec:
               value: {{ default "styx-snapshots" .Values.rustfs.bucket | quote }}
             - name: WORKER_THREADS
               value: {{ default "1" $env.WORKER_THREADS | quote }}
+            {{- with $env.SEQUENCE_MAX_SIZE }}
+            - name: SEQUENCE_MAX_SIZE
+              value: {{ . | quote }}
+            {{- end }}
             - name: DISCOVERY_HOST
               valueFrom:
                 configMapKeyRef:

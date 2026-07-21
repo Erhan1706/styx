@@ -22,15 +22,27 @@ COPY --chown=styx:styx coordinator/pyproject.toml coordinator/uv.lock ./
 
 RUN id styx
 
+# When true, install the optional 'autoscale' extra (chronos, pandas, torch).
+# Kept out of the default build so non-autoscale runs stay lightweight.
+ARG install_autoscale=false
+
 # Stage 1: Install all external deps (cached)
 RUN --mount=type=cache,target=/home/styx/.cache/uv \
-    uv sync --frozen --no-install-package styx
+    if [ "$install_autoscale" = "true" ]; then \
+        uv sync --frozen --no-install-package styx --extra autoscale; \
+    else \
+        uv sync --frozen --no-install-package styx; \
+    fi
 
 COPY --chown=styx:styx styx-package /usr/local/styx-package/
 
 # Stage 2: Copy local package and finish
 RUN --mount=type=cache,target=/home/styx/.cache/uv \
-    uv sync --frozen
+    if [ "$install_autoscale" = "true" ]; then \
+        uv sync --frozen --extra autoscale; \
+    else \
+        uv sync --frozen; \
+    fi
 
 COPY --chown=styx:styx coordinator coordinator
 COPY --chown=styx:styx models models

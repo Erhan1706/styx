@@ -142,7 +142,6 @@ class StatefulFunction(Function):
                     self.__key,
                 )
             # 3) Run user logic while holding the operator lock.
-            # logging.warning(f"Running user logic for {self.__operator_name}:{self.__key}")
             async with self.__operator_lock:
                 res = await self.run(*args)
 

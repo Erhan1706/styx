@@ -21,6 +21,7 @@ styx:
     env:
       HEARTBEAT_LIMIT: "5000"
       HEARTBEAT_CHECK_INTERVAL: "500"
+      ENABLE_AUTOSCALE: "true"
     resources: {}
     service:
       type: ClusterIP
@@ -33,15 +34,20 @@ styx:
     replicas: 1
     env:
       INGRESS_TYPE: KAFKA
-      WORKER_THREADS: "2"
+      WORKER_THREADS: "1"
     resources:
-      requests:
-        cpu: "500m"
       limits:
-        cpu: "1"
+        cpu: "2"
+        memory: "8Gi"
     service:
       type: ClusterIP
       port: 8000
+
+  # Standby workers inherit worker.image, worker.env, and worker.resources unless
+  # overridden here (see worker-standby-deployment.yaml).
+  workerStandby:
+    enabled: false
+    replicas: 0
 
   rustfs:
     accessKey: "rustfsadmin"

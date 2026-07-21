@@ -21,6 +21,8 @@ styx:
     env:
       HEARTBEAT_LIMIT: "5000"
       HEARTBEAT_CHECK_INTERVAL: "500"
+      ENABLE_AUTOSCALE: "true"
+      MIGRATION_COLD_START_HORIZON_SEC: "15"
     resources: {}
     service:
       type: ClusterIP
@@ -37,6 +39,10 @@ styx:
     service:
       type: ClusterIP
       port: 8000
+
+  workerStandby:
+    enabled: false
+    replicas: 0
 
   rustfs:
     accessKey: "rustfsadmin"

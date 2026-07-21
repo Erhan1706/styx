@@ -1,6 +1,7 @@
 """Unit tests for coordinator/aria_sync_metadata.py"""
 
 from coordinator.aria_sync_metadata import AriaSyncMetadata
+from styx.common.message_types import MessageType
 
 # ---------------------------------------------------------------------------
 # check_distributed_barrier
@@ -10,23 +11,23 @@ from coordinator.aria_sync_metadata import AriaSyncMetadata
 class TestCheckDistributedBarrier:
     def test_false_when_no_workers_arrived(self):
         meta = AriaSyncMetadata(n_workers=3)
-        assert meta.check_distributed_barrier() is False
+        assert meta.check_distributed_barrier(MessageType.AriaProcessingDone) is False
 
     def test_false_when_partial_workers_arrived(self):
         meta = AriaSyncMetadata(n_workers=3)
-        meta.arrived.add(1)
-        meta.arrived.add(2)
-        assert meta.check_distributed_barrier() is False
+        meta.arrived[MessageType.AriaProcessingDone].add(1)
+        meta.arrived[MessageType.AriaProcessingDone].add(2)
+        assert meta.check_distributed_barrier(MessageType.AriaProcessingDone) is False
 
     def test_true_when_all_workers_arrived(self):
         meta = AriaSyncMetadata(n_workers=3)
-        meta.arrived.update({1, 2, 3})
-        assert meta.check_distributed_barrier() is True
+        meta.arrived[MessageType.AriaProcessingDone].update({1, 2, 3})
+        assert meta.check_distributed_barrier(MessageType.AriaProcessingDone) is True
 
     def test_single_worker_cluster(self):
         meta = AriaSyncMetadata(n_workers=1)
-        meta.arrived.add(1)
-        assert meta.check_distributed_barrier() is True
+        meta.arrived[MessageType.AriaProcessingDone].add(1)
+        assert meta.check_distributed_barrier(MessageType.AriaProcessingDone) is True
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +77,8 @@ class TestSetAriaProcessingDone:
         meta.set_aria_processing_done(1, {1})
         meta.set_aria_processing_done(1, {2})  # same worker again
         # arrived is a set, so still size 1
-        assert len(meta.arrived) == 1
-        assert meta.check_distributed_barrier() is False
+        assert len(meta.arrived[MessageType.AriaProcessingDone]) == 1
+        assert meta.check_distributed_barrier(MessageType.AriaProcessingDone) is False
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +129,12 @@ class TestSetAriaCommitDone:
 class TestSetEmptySyncDone:
     def test_returns_false_before_all_workers(self):
         meta = AriaSyncMetadata(n_workers=3)
-        assert meta.set_empty_sync_done(1) is False
+        assert meta.set_empty_sync_done(MessageType.AriaProcessingDone, 1) is False
 
     def test_returns_true_when_all_workers_arrived(self):
         meta = AriaSyncMetadata(n_workers=2)
-        meta.set_empty_sync_done(1)
-        result = meta.set_empty_sync_done(2)
+        meta.set_empty_sync_done(MessageType.AriaProcessingDone, 1)
+        result = meta.set_empty_sync_done(MessageType.AriaProcessingDone, 2)
         assert result is True
 
 
@@ -283,23 +284,24 @@ class TestMergeRwReservations:
 class TestCleanup:
     def test_cleanup_resets_arrived(self):
         meta = AriaSyncMetadata(n_workers=2)
-        meta.arrived.update({1, 2})
-        meta.cleanup()
-        assert len(meta.arrived) == 0
+        meta.arrived[MessageType.AriaProcessingDone].update({1, 2})
+        meta.reset(MessageType.AriaProcessingDone)
+        assert len(meta.arrived[MessageType.AriaProcessingDone]) == 0
 
     def test_cleanup_resets_aborts(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.logic_aborts_everywhere = {1, 2}
         meta.concurrency_aborts_everywhere = {3}
-        meta.cleanup()
+        meta.reset(MessageType.AriaProcessingDone)
         assert len(meta.logic_aborts_everywhere) == 0
+        meta.reset(MessageType.AriaCommit)
         assert len(meta.concurrency_aborts_everywhere) == 0
 
     def test_cleanup_resets_counters(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.processed_seq_size = 500
         meta.max_t_counter = 42
-        meta.cleanup()
+        meta.reset(MessageType.AriaCommit)
         assert meta.processed_seq_size == 0
         assert meta.max_t_counter == -1
 
@@ -308,7 +310,7 @@ class TestCleanup:
         meta.global_write_set = {"ns": {0: {1}}}
         meta.global_read_set = {"ns": {0: {1}}}
         meta.global_read_reservations = {"ns": {"k": [1]}}
-        meta.cleanup()
+        meta.reset(MessageType.DeterministicReordering)
         assert meta.global_write_set is None
         assert meta.global_read_set is None
         assert meta.global_read_reservations is None
@@ -316,29 +318,29 @@ class TestCleanup:
     def test_cleanup_resets_sent_proceed_msg(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.sent_proceed_msg = True
-        meta.cleanup()
+        meta.reset(MessageType.AriaProcessingDone)
         assert meta.sent_proceed_msg is False
 
     def test_cleanup_epoch_end_resets_stop_next_epoch(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.stop_next_epoch = True
-        meta.cleanup(epoch_end=True)
+        meta.reset(MessageType.SyncCleanup)
         assert meta.stop_next_epoch is False
 
     def test_cleanup_without_epoch_end_preserves_stop_next_epoch(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.stop_next_epoch = True
-        meta.cleanup(epoch_end=False)
+        meta.reset(MessageType.AriaCommit)
         assert meta.stop_next_epoch is True
 
     def test_cleanup_take_snapshot_resets_flag(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.take_snapshot = True
-        meta.cleanup(take_snapshot=True)
+        meta.reset(MessageType.AriaCommit)
         assert meta.take_snapshot is False
 
     def test_cleanup_without_take_snapshot_preserves_flag(self):
         meta = AriaSyncMetadata(n_workers=2)
         meta.take_snapshot = True
-        meta.cleanup(take_snapshot=False)
+        meta.reset(MessageType.AriaProcessingDone)
         assert meta.take_snapshot is True

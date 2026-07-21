@@ -2,14 +2,14 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-import requests
 import pandas as pd
-from pathlib import Path
+import requests
 
-PROM = "http://localhost:9090"
-
+from metrics_urls import prometheus_url as get_prometheus_url
+PROM = get_prometheus_url()
 
 @dataclass(frozen=True)
 class MetadataParams:
@@ -35,11 +35,12 @@ def query_prometheus_range(
     start_time: float,  # Unix timestamp (seconds)
     end_time: float,
     step: str = "1s",
-    prometheus_url: str = "http://localhost:9090",
+    prometheus_url: str | None = None,
 ) -> pd.DataFrame:
     """Query Prometheus for a time series over a range."""
+    url = prometheus_url or get_prometheus_url()
     resp = requests.get(
-        f"{prometheus_url}/api/v1/query_range",
+        f"{url}/api/v1/query_range",
         params={
             "query": metric,
             "start": start_time,
@@ -73,10 +74,11 @@ def export_metrics(
     save_dir: Path,
     start_time: float,
     end_time: float,
-    prometheus_url: str = "http://localhost:9090",
+    prometheus_url: str | None = None,
     step: str = "1s",
 ):
     """Export key metrics from Prometheus to CSV files."""
+    prometheus_url = prometheus_url or get_prometheus_url()
     metrics = {
         "backlog": "sum(queue_backlog)",
         "num_workers": "live_worker_count",

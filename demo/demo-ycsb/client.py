@@ -23,6 +23,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from export_metadata import MetadataParams, save_metadata, export_metrics
 from migration_tracker import MigrationTracker
 from load_generator import LoadSchedule
+from metrics_urls import coordinator_metrics_url
 from tqdm import tqdm
 from ycsb import ycsb_operator
 from zipfian_generator import ZipfGenerator
@@ -220,7 +221,7 @@ def main():
 
 if __name__ == "__main__":
     if autoscaling_enabled:
-        tracker = MigrationTracker("http://localhost:8000/metrics")
+        tracker = MigrationTracker(coordinator_metrics_url())
         tracker.start()
 
     start_time = time.time()
@@ -252,7 +253,6 @@ if __name__ == "__main__":
         save_dir=SAVE_DIR,
         start_time=start_time,
         end_time=end_time,
-        prometheus_url="http://localhost:9090",
         step="1s",
     )
     

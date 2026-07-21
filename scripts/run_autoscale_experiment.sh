@@ -72,6 +72,8 @@ _k8s_setup() {
     export STYX_PORT=8888
     export KAFKA_URL="${RELEASE_NAME}-kafka-headless:9092"
     export S3_ENDPOINT="http://${RELEASE_NAME}-rustfs:9000"
+    export COORDINATOR_METRICS_URL="http://${RELEASE_NAME}-styx-coordinator:8000/metrics"
+    export PROMETHEUS_URL="http://${RELEASE_NAME}-prometheus:9090"
 }
 
 case "$workload_profile" in
@@ -83,22 +85,20 @@ case "$workload_profile" in
 esac
 load_config_path="demo/load_profiles/$workload_profile.yaml"
 
-if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; then
-    bash scripts/install_styx_cluster_with_helm.sh
-    _k8s_setup
+_compute_worker_replicas() {
+    local minimum_amount_of_workers=1
+    threaded_scale_factor=$(( (n_part + styx_threads_per_worker - 1) / styx_threads_per_worker ))
+    (( threaded_scale_factor < minimum_amount_of_workers )) && threaded_scale_factor=$minimum_amount_of_workers
+    echo "$threaded_scale_factor"
+}
 
-else
-    # docker-compose mode
-    bash scripts/start_styx_cluster.sh "$n_part" "$epoch_size" "$styx_threads_per_worker" "$enable_compression" "$use_composite_keys" "$autoscaling_enabled"
-    docker compose --profile autoscale up --scale worker-standby="$num_standby_workers" -d worker-standby >/dev/null
-
-    # Wait for at least one worker to register with the coordinator
+_wait_for_workers() {
+    local metrics_url=$1
     echo "Waiting for workers to register with coordinator..."
     max_wait=120
     waited=0
     while true; do
-        # Query Prometheus metrics for live_worker_count
-        worker_count=$(curl -s http://localhost:8000/metrics 2>/dev/null | grep -E '^live_worker_count ' | awk '{print $2}' | cut -d. -f1 || true)
+        worker_count=$(curl -s "$metrics_url" 2>/dev/null | grep -E '^live_worker_count ' | awk '{print $2}' | cut -d. -f1 || true)
         if [[ -n "$worker_count" && "$worker_count" -ge 1 ]]; then
             echo "Workers ready: $worker_count worker(s) registered"
             break
@@ -113,6 +113,29 @@ else
             echo "  Still waiting for workers... (${waited}s / ${max_wait}s)"
         fi
     done
+}
+
+if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; then
+    export STYX_WORKER_REPLICAS=$(_compute_worker_replicas)
+    export STYX_STANDBY_REPLICAS="$num_standby_workers"
+    export STYX_WORKER_THREADS="$styx_threads_per_worker"
+    export STYX_SEQUENCE_MAX_SIZE="$epoch_size"
+    export STYX_ENABLE_AUTOSCALE="$autoscaling_enabled"
+    echo "k8s worker replicas: $STYX_WORKER_REPLICAS (n_part=$n_part, threads=$styx_threads_per_worker)"
+    echo "k8s standby replicas: $STYX_STANDBY_REPLICAS"
+
+    bash scripts/install_styx_cluster_with_helm.sh
+    _k8s_setup
+    _wait_for_workers "${COORDINATOR_METRICS_URL:-http://${RELEASE_NAME}-styx-coordinator:8000/metrics}"
+
+else
+    # docker-compose mode
+    export COORDINATOR_METRICS_URL="${COORDINATOR_METRICS_URL:-http://localhost:8000/metrics}"
+    export PROMETHEUS_URL="${PROMETHEUS_URL:-http://localhost:9090}"
+    bash scripts/start_styx_cluster.sh "$n_part" "$epoch_size" "$styx_threads_per_worker" "$enable_compression" "$use_composite_keys" "$autoscaling_enabled"
+    docker compose --profile autoscale up --scale worker-standby="$num_standby_workers" -d worker-standby >/dev/null
+
+    _wait_for_workers "$COORDINATOR_METRICS_URL"
 fi
 
 if [[ $workload_name == "ycsbt" ]]; then

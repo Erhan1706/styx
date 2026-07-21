@@ -1,8 +1,11 @@
-{{- $coord := (.Values.coordinator | default dict) -}}
-{{- $img := ($coord.image | default dict) -}}
-{{- $ports := ($coord.ports | default dict) -}}
-{{- $env := ($coord.env | default dict) -}}
-{{- $resources := ($coord.resources | default dict) -}}
+{{- $standby := (.Values.workerStandby | default dict) -}}
+{{- if (default false $standby.enabled) -}}
+{{- $worker := (.Values.worker | default dict) -}}
+{{- $workerSvc := ($worker.service | default dict) -}}
+{{- $img := (default ($worker.image | default dict) $standby.image) -}}
+{{- $env := (mergeOverwrite (deepCopy ($worker.env | default dict)) ($standby.env | default dict)) -}}
+{{- $resources := (default ($worker.resources | default dict) $standby.resources) -}}
+{{- $nThreads := int (default "1" $env.WORKER_THREADS) -}}
 {{- $wait := (.Values.wait | default dict) -}}
 {{- $waitMode := (default "tcp" $wait.mode) -}}
 {{- $waitK8s := ($wait.k8s | default dict) -}}
@@ -14,21 +17,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "styx.fullname" . }}-coordinator
+  name: {{ include "styx.fullname" . }}-worker-standby
   labels:
     {{- include "styx.labels" . | nindent 4 }}
-    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/component: worker-standby
 spec:
-  replicas: {{ default 1 $coord.replicas }}
+  replicas: {{ default 0 $standby.replicas }}
   selector:
     matchLabels:
       {{- include "styx.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: coordinator
+      app.kubernetes.io/component: worker-standby
   template:
     metadata:
       labels:
         {{- include "styx.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: coordinator
+        app.kubernetes.io/component: worker-standby
     spec:
       serviceAccountName: {{ include "styx.fullname" . }}
       {{- with .Values.imagePullSecrets }}
@@ -124,17 +127,21 @@ spec:
               fi
       {{ end }}
       containers:
-        - name: coordinator
-          image: "{{ default "dev/styx-coordinator" $img.repository }}:{{ default "latest" $img.tag }}"
+        - name: worker-standby
+          image: "{{ default "dev/styx" $img.repository }}:{{ default "latest" $img.tag }}"
           imagePullPolicy: {{ default "IfNotPresent" $img.pullPolicy }}
           ports:
-            - name: discovery
-              containerPort: {{ default 8888 $ports.discovery }}
-            - name: protocol
-              containerPort: {{ default 8889 $ports.protocol }}
             - name: http
-              containerPort: {{ default 8000 $ports.http }}
+              containerPort: {{ default 8000 $workerSvc.port }}
+            {{- range $i := until $nThreads }}
+            - name: ctl-{{ $i }}
+              containerPort: {{ add 5000 $i }}
+            - name: proto-{{ $i }}
+              containerPort: {{ add 6000 $i }}
+            {{- end }}
           env:
+            - name: INGRESS_TYPE
+              value: {{ default "KAFKA" $env.INGRESS_TYPE | quote }}
             - name: KAFKA_URL
               valueFrom:
                 configMapKeyRef:
@@ -148,13 +155,24 @@ spec:
               value: {{ default "" .Values.rustfs.secretKey | quote }}
             - name: SNAPSHOT_BUCKET_NAME
               value: {{ default "styx-snapshots" .Values.rustfs.bucket | quote }}
-            - name: HEARTBEAT_LIMIT
-              value: {{ default "5000" $env.HEARTBEAT_LIMIT | quote }}
-            - name: HEARTBEAT_CHECK_INTERVAL
-              value: {{ default "500" $env.HEARTBEAT_CHECK_INTERVAL | quote }}
-            - name: ENABLE_AUTOSCALE
-              value: {{ default "true" $env.ENABLE_AUTOSCALE | quote }}
-            - name: MIGRATION_COLD_START_HORIZON_SEC
-              value: {{ default "15" $env.MIGRATION_COLD_START_HORIZON_SEC | quote }}
+            - name: WORKER_THREADS
+              value: {{ default "1" $env.WORKER_THREADS | quote }}
+            {{- with $env.SEQUENCE_MAX_SIZE }}
+            - name: SEQUENCE_MAX_SIZE
+              value: {{ . | quote }}
+            {{- end }}
+            - name: WORKER_STANBY
+              value: "true"
+            - name: DISCOVERY_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "styx.fullname" . }}-config
+                  key: DISCOVERY_HOST
+            - name: DISCOVERY_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "styx.fullname" . }}-config
+                  key: DISCOVERY_PORT
           resources:
             {{- toYaml $resources | nindent 12 }}
+{{- end }}

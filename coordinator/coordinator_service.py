@@ -33,7 +33,6 @@ from styx.common.util.aio_task_scheduler import AIOTaskScheduler
 import uvloop
 
 from coordinator.capacity_model import SystemCapacityEstimator
-from coordinator.chronos_forecaster import ChronosForecaster
 from coordinator.metric_buffer import AggregatingMetricBuffer
 from coordinator.migration_metadata import MigrationMetadata
 from coordinator.pid_controller import BacklogPIDController
@@ -41,6 +40,9 @@ from coordinator.pid_controller import BacklogPIDController
 if TYPE_CHECKING:
     from styx.common.stateflow_graph import StateflowGraph
 
+    # Imported lazily at runtime (only when autoscaling is enabled) to avoid
+    # pulling in chronos/torch/pandas in non-autoscale builds.
+    from coordinator.chronos_forecaster import ChronosForecaster
     from coordinator.worker_pool import Worker
 
 SERVER_PORT = 8888
@@ -67,7 +69,7 @@ CHRONOS_FORECAST_INTERVAL: float = float(os.getenv("CHRONOS_FORECAST_INTERVAL", 
 # Migration time estimation.
 # Cold-start horizon used only before the first migration has been measured;
 # afterwards the estimate is driven entirely by the learned per-moved-key rate.
-MIGRATION_COLD_START_HORIZON_SEC: float = float(os.getenv("MIGRATION_COLD_START_HORIZON_SEC", "45"))
+MIGRATION_COLD_START_HORIZON_SEC: float = float(os.getenv("MIGRATION_COLD_START_HORIZON_SEC", "30"))
 MIN_CHRONOS_PREDICTION_HORIZON: int = int(os.getenv("MIN_CHRONOS_PREDICTION_HORIZON", "10"))
 
 CoordHandler = Callable[[StreamWriter, bytes, concurrent.futures.ProcessPoolExecutor], Awaitable[None]]
@@ -326,6 +328,7 @@ class CoordinatorService:
         self._downscale_penalty_max: float = self.scale_cooldown_period * 30
 
         self.pid_controller = BacklogPIDController()
+        self._last_epoch_total_backlog: float = 0.0
         # Per-epoch accumulators: populated as each worker reports, consumed when all have synced
         self.epoch_backlog_accum: dict[int, float] = {}
         self.epoch_rate_accum: dict[int, float] = {}
@@ -976,11 +979,15 @@ class CoordinatorService:
             self.total_keys = sum(self.num_keys_accum.values())
             self.tps_sliding_window.add(total_tps)
 
+            if not self.migration_in_progress and total_backlog >= self.pid_controller.backlog_threshold:
+                n_participating = len(self.coordinator.worker_pool.get_participating_workers())
+                self.system_capacity_estimator.observe_saturated_capacity(n_participating, total_tps)
+
+            self._last_epoch_total_backlog = total_backlog
             # Clear accumulators for the next epoch
             self.epoch_backlog_accum.clear()
             self.epoch_rate_accum.clear()
             self.num_keys_accum.clear()
-            # logging.warning(f"Epoch duration: {self.epoch_duration_window.average()}")
 
             if self.enable_autoscale and not self.migration_in_progress:
                 smoothed_tps = self.tps_sliding_window.average() or 0.0
@@ -1007,9 +1014,7 @@ class CoordinatorService:
         return 0.0
 
     @staticmethod
-    def _graph_operator_partitions(graph) -> int:
-        if graph is None:
-            return 1
+    def _graph_operator_partitions(graph: StateflowGraph) -> int:
         return max((op.n_partitions for op in graph.nodes.values()), default=1)
 
     def _planned_partition_counts(self) -> tuple[int, int]:
@@ -1123,8 +1128,8 @@ class CoordinatorService:
             n_workers + 1,
             int(peak_p75 / (per_worker_capacity * headroom_factor)) + 1,
         )
-        # Don't more than double the cluster in one step
-        to_add = min(n_needed - n_workers, n_workers)
+
+        to_add = n_needed - n_workers
         # scale_up only activates workers from _standby_queue; clamp and skip if none left
         to_add = self._resolve_scale_up_workers(to_add)
         if to_add <= 0:
@@ -1146,11 +1151,13 @@ class CoordinatorService:
         n_workers = len(self.coordinator.worker_pool.get_live_workers())
         # Backlog must be essentially zero before considering downscale,
         # use value a little above zero to account for timing jitter on the worker side
-        total_backlog = sum(self.epoch_backlog_accum.values())
-        if n_workers <= 1 or total_backlog >= self.pid_controller.backlog_threshold or self._capacity_ewma is None:
+        if (
+            n_workers <= 1
+            or self._last_epoch_total_backlog >= self.pid_controller.backlog_threshold
+            or self._capacity_ewma is None
+        ):
             return False, 0
 
-        per_worker_cap = self._capacity_ewma / n_workers
         # Determine peak expected demand (pessimistic: use current rate and p90 forecast)
         peak_demand = self.tps_sliding_window.average() or 0.0
         if predictions:
@@ -1161,7 +1168,10 @@ class CoordinatorService:
         # Can n workers handle peak demand with headroom?
         to_remove = 0
         for n in range(n_workers - 1, 1, -1):
-            estimated_capacity = per_worker_cap * n * self.downscale_safety_factor
+            capacity_n = self.system_capacity_estimator.capacity_for_workers(n)
+            if capacity_n is None:
+                break
+            estimated_capacity = capacity_n * self.downscale_safety_factor
             logging.warning(f"SCALE DOWN: estimated_capacity={estimated_capacity:.0f} | peak_demand={peak_demand:.0f}")
             if peak_demand < estimated_capacity:
                 logging.warning(f"SCALE DOWN: removing {n_workers - n} workers")
@@ -1177,32 +1187,41 @@ class CoordinatorService:
         process and poll for results.  Runs as a long-lived coroutine."""
         while True:
             await asyncio.sleep(CHRONOS_FORECAST_INTERVAL)
-            if self.chronos_forecaster is None or not self.chronos_forecaster.is_alive or self.migration_in_progress:
-                continue
+            try:
+                if (
+                    self.chronos_forecaster is None
+                    or not self.chronos_forecaster.is_alive
+                    or self.migration_in_progress
+                ):
+                    continue
 
-            context = self.metric_buffer.snapshot()
-            if not context:
-                continue
+                context = self.metric_buffer.snapshot()
+                if not context:
+                    continue
 
-            prediction_horizon = self._estimate_migration_time(self.total_keys)
-            self.chronos_forecaster.submit(
-                context,
-                prediction_length=ceil(prediction_horizon),
-            )
-            predictions = self.chronos_forecaster.poll()
-            logging.warning(f"CHRONOS | predictions: {predictions}")
-            if predictions and self.enable_autoscale and not self.migration_in_progress:
-                should_scale, to_add = self._compute_predictive_upscaling(predictions)
-                if should_scale and not (time.time() - self.last_scale_action_time < self.scale_cooldown_period):
-                    n_workers = len(self.coordinator.worker_pool.get_participating_workers())
-                    new_partition_num = n_workers + to_add
-                    await self.scale_up(new_partition_num, to_add)
+                prediction_horizon = self._estimate_migration_time(self.total_keys)
+                self.chronos_forecaster.submit(
+                    context,
+                    prediction_length=ceil(prediction_horizon),
+                )
+                predictions = self.chronos_forecaster.poll()
+                logging.warning(f"FORECAST | predictions: {predictions}")
+                if predictions and self.enable_autoscale and not self.migration_in_progress:
+                    should_scale, to_add = self._compute_predictive_upscaling(predictions)
+                    if should_scale and not (time.time() - self.last_scale_action_time < self.scale_cooldown_period):
+                        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+                        new_partition_num = n_workers + to_add
+                        await self.scale_up(new_partition_num, to_add)
 
-                elif not should_scale:
-                    # Check for downscaling opportunity if we didn't scale up
-                    should_downscale, to_remove = self._compute_predictive_downscaling(predictions)
-                    if should_downscale:
-                        await self.scale_down(to_remove)
+                    elif not should_scale:
+                        # Check for downscaling opportunity if we didn't scale up
+                        should_downscale, to_remove = self._compute_predictive_downscaling(predictions)
+                        if should_downscale:
+                            await self.scale_down(to_remove)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("FORECAST LOOP | iteration failed")
 
     def _record_epoch_metrics(
         self,
@@ -1671,6 +1690,8 @@ class CoordinatorService:
         logging.warning("Coordinator Snapshotting online")
 
         if self.enable_autoscale:
+            from coordinator.chronos_forecaster import ChronosForecaster
+
             self.chronos_forecaster = ChronosForecaster()
             self.chronos_forecaster.start()
             self.forecaster_task = asyncio.create_task(self.chronos_forecast_loop())

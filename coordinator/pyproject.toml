@@ -16,6 +16,10 @@ dependencies = [
     "styx",
     "uvloop==0.22.1",
     "zstandard==0.25.0",
+]
+
+[project.optional-dependencies]
+autoscale = [
     "chronos-forecasting==2.2.2",
     "pandas==3.0.1",
 ]

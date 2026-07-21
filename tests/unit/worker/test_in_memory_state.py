@@ -376,7 +376,7 @@ class TestExists:
         # so it should not be considered as existing locally.
         s = _state()
         s.data[OP_PART]["k"] = "v"
-        s.keys_to_send[OP_PART] = {("k", 1)}
+        s.add_keys_to_send({OP_PART: {("k", 1)}})
         assert s.exists("k", OP, PART) is False
 
     def test_true_outside_migration_context(self):

@@ -19,6 +19,7 @@ coordinator:
   env:
     HEARTBEAT_LIMIT: "5000"
     HEARTBEAT_CHECK_INTERVAL: "500"
+    ENABLE_AUTOSCALE: "true"
   resources: {}
   service:
     type: ClusterIP
@@ -35,6 +36,14 @@ worker:
   service:
     type: ClusterIP
     port: 8000
+
+# Pre-warmed standby workers activated by the coordinator during scale-up.
+# Mirrors docker-compose worker-standby
+workerStandby:
+  enabled: false
+  replicas: 0
+  env: {}
+  resources: {}
 
 kafka:
   url: ""

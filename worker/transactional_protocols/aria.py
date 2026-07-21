@@ -179,7 +179,7 @@ class AriaProtocol(BaseTransactionalProtocol):
             MessageType.Unlock: self._handle_unlock,
             MessageType.DeterministicReordering: self._handle_deterministic_reordering,
             MessageType.RemoteWantsToProceed: self._handle_remote_wants_to_proceed,
-            MessageType.AsyncMigration: self._handle_async_migration,
+            MessageType.AsyncMigration: self.handle_async_migration,
         }
 
         # Idle time tracking for downscaling policies
@@ -243,6 +243,10 @@ class AriaProtocol(BaseTransactionalProtocol):
             pass
         except Exception as e:
             logging.error(f"Task {task.get_name()} crashed: {e}\n{format_exc()}")
+
+    def reset_sync_barriers(self) -> None:
+        for event in self.sync_workers_event.values():
+            event.clear()
 
     def start(self) -> None:
         if self.registered_operators:
@@ -514,7 +518,7 @@ class AriaProtocol(BaseTransactionalProtocol):
             self.remote_wants_to_proceed = True
             self.ingress.messages_available.set()
 
-    async def _handle_async_migration(self, data: bytes) -> None:
+    async def handle_async_migration(self, data: bytes) -> None:
         # Lock-free: no awaits.
         operator_partition, batch = self.networking.decode_message(data)
         logging.warning(
@@ -549,7 +553,6 @@ class AriaProtocol(BaseTransactionalProtocol):
     ) -> None:
         """Send a migration batch to destination workers in parallel."""
         send_tasks = []
-        logging.info("MIGRATION | Sending batch for migration")
         for operator_partition, k_v_pairs in batch.items():
             operator_name, partition = operator_partition
             worker = self.dns[operator_name][partition]
@@ -622,13 +625,15 @@ class AriaProtocol(BaseTransactionalProtocol):
         logging.warning("STARTED function scheduler")
 
         while self.running:
-            # Wait until the ingress signals that messages are available,
-            # or a remote peer wants to proceed, instead of busy-spinning.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    self.ingress.messages_available.wait(),
-                    timeout=0.1,
-                )
+            # Only wait when there is no backlog in the sequencer
+            if not self.sequencer.distributed_log:
+                # Wait until the ingress signals that messages are available,
+                # or a remote peer wants to proceed, instead of busy-spinning.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self.ingress.messages_available.wait(),
+                        timeout=0.1,
+                    )
             self.ingress.messages_available.clear()
 
             async with self.sequencer.lock:
@@ -1246,9 +1251,10 @@ class AriaProtocol(BaseTransactionalProtocol):
         # Release the locks for local
         await self.unlock_tid(t_id)
         # Release the locks for remote participants
-        if self.networking.chain_participants.get(t_id):
+        peers_to_notify = [pid for pid in self.peers if pid != self.id]
+        if peers_to_notify:
             async with asyncio.TaskGroup() as tg:
-                for participant in self.networking.chain_participants[t_id]:
+                for participant in peers_to_notify:
                     tg.create_task(
                         self.networking.send_message(
                             self.peers[participant][0],

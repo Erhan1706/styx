@@ -250,14 +250,12 @@ name = "coordinator"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "chronos-forecasting" },
     { name = "cityhash" },
     { name = "cloudpickle" },
     { name = "confluent-kafka" },
     { name = "geopy" },
     { name = "minio" },
     { name = "msgspec" },
-    { name = "pandas" },
     { name = "prometheus-client" },
     { name = "setuptools" },
     { name = "styx" },
@@ -265,22 +263,29 @@ dependencies = [
     { name = "zstandard" },
 ]
 
+[package.optional-dependencies]
+autoscale = [
+    { name = "chronos-forecasting" },
+    { name = "pandas" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "chronos-forecasting", specifier = "==2.2.2" },
+    { name = "chronos-forecasting", marker = "extra == 'autoscale'", specifier = "==2.2.2" },
     { name = "cityhash", specifier = "==0.4.10" },
     { name = "cloudpickle", specifier = "==3.1.2" },
     { name = "confluent-kafka", specifier = "==2.14.0" },
     { name = "geopy", specifier = ">=2.4.1" },
     { name = "minio", specifier = "==7.2.20" },
     { name = "msgspec", specifier = "==0.20.0" },
-    { name = "pandas", specifier = "==3.0.1" },
+    { name = "pandas", marker = "extra == 'autoscale'", specifier = "==3.0.1" },
     { name = "prometheus-client", specifier = "==0.24.1" },
     { name = "setuptools", specifier = "==80.10.1" },
     { name = "styx", directory = "../styx-package" },
     { name = "uvloop", specifier = "==0.22.1" },
     { name = "zstandard", specifier = "==0.25.0" },
 ]
+provides-extras = ["autoscale"]
 
 [[package]]
 name = "cuda-bindings"

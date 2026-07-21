@@ -23,7 +23,6 @@ class AriaSyncMetadata:
         self.take_snapshot: bool = False
 
     def check_distributed_barrier(self, mt: MessageType) -> bool:
-        # logging.warning(f"Arrived workers: {self.arrived[mt]} and n_workers: {self.n_workers}")
         return len(self.arrived[mt]) == self.n_workers
 
     def stop_in_next_epoch(self) -> None:
