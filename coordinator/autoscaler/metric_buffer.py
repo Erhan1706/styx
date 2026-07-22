@@ -28,7 +28,7 @@ class MetricBuffer:
             self._series[name].append(MetricSample(ts, value))
 
     def snapshot(self) -> dict[str, list[float]]:
-        """Return a {name: [values]} snapshot suitable for Chronos context."""
+        """Return a {name: [values]} snapshot suitable for the forecaster context."""
         with self._lock:
             return {name: [s.value for s in buf] for name, buf in self._series.items() if buf}
 
@@ -79,7 +79,7 @@ class AggregatingMetricBuffer:
                 self._finalized[name].append((b, self._pending[name].pop(b)))
 
     def snapshot(self) -> dict[str, list[float]]:
-        """Return {name: [aggregated_values]} for Chronos context (values only)."""
+        """Return {name: [aggregated_values]} for the forecaster context (values only)."""
         with self._lock:
             return {name: [v for _, v in buf] for name, buf in self._finalized.items() if buf}
 

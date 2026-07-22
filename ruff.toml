@@ -60,9 +60,11 @@ ignore = [
   "LOG015",
 
   "INP001",
-  
+  "PLC0415",
   # --- Allow commented out code
   "ERA001", 
+  # --- Allow comments to have f-strings
+  "G004", 
 ]
 
 fixable = ["ALL"]

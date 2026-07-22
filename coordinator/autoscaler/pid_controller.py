@@ -25,7 +25,7 @@ class BacklogPIDController:
 
         error = total_backlog / smoothed_tps
 
-        logging.warning(f"CONTROLLER | Total backlog: {total_backlog}; tps: {smoothed_tps}")
+        # logging.debug(f"CONTROLLER | Total backlog: {total_backlog}; tps: {smoothed_tps}")
         if self.prev_error is None:
             self.prev_error = error
         # P: how bad is it right now?
@@ -43,6 +43,6 @@ class BacklogPIDController:
         d_term = self.kd * self.smoothed_derivative
 
         self.prev_error = error
-        logging.warning(f"CONTROLLER | P term: {p_term}, I term: {i_term}, D term: {d_term}")
+        logging.debug(f"CONTROLLER | P term: {p_term}, I term: {i_term}, D term: {d_term}")
 
         return p_term + i_term + d_term

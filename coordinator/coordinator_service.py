@@ -16,12 +16,17 @@ from timeit import default_timer as timer
 from typing import TYPE_CHECKING
 
 from aria_sync_metadata import AriaSyncMetadata
+from autoscaler.capacity_model import SystemCapacityEstimator
+from autoscaler.metric_buffer import AggregatingMetricBuffer
+from autoscaler.migration_cost_model import MigrationCostModel
+from autoscaler.pid_controller import BacklogPIDController
+from autoscaler.scaling_policy import ScalingPolicy
+from autoscaler.sliding_window_metric import SlidingWindowMetric
 import boto3
 import botocore
 from coordinator_metadata import Coordinator
 from prometheus_client import Counter, Gauge, start_http_server
 from setuptools._distutils.util import strtobool
-from sliding_window_metric import SlidingWindowMetric
 from styx.common.base_networking import SOCKET_RCV_BUF, SOCKET_SND_BUF
 from styx.common.logging import logging
 from styx.common.message_types import MessageType
@@ -32,17 +37,14 @@ from styx.common.tcp_networking import MessagingMode, NetworkingManager
 from styx.common.util.aio_task_scheduler import AIOTaskScheduler
 import uvloop
 
-from coordinator.capacity_model import SystemCapacityEstimator
-from coordinator.metric_buffer import AggregatingMetricBuffer
 from coordinator.migration_metadata import MigrationMetadata
-from coordinator.pid_controller import BacklogPIDController
 
 if TYPE_CHECKING:
-    from styx.common.stateflow_graph import StateflowGraph
-
     # Imported lazily at runtime (only when autoscaling is enabled) to avoid
     # pulling in chronos/torch/pandas in non-autoscale builds.
-    from coordinator.chronos_forecaster import ChronosForecaster
+    from autoscaler.chronos_forecaster import ChronosForecaster
+    from styx.common.stateflow_graph import StateflowGraph
+
     from coordinator.worker_pool import Worker
 
 SERVER_PORT = 8888
@@ -66,11 +68,6 @@ S3_INIT_MAX_RETRIES: int = int(os.getenv("S3_INIT_MAX_RETRIES", "30"))
 SEQUENCE_MAX_SIZE: int = int(os.getenv("SEQUENCE_MAX_SIZE", "1_000"))
 CHRONOS_FORECAST_INTERVAL: float = float(os.getenv("CHRONOS_FORECAST_INTERVAL", "2.0"))
 
-# Migration time estimation.
-# Cold-start horizon used only before the first migration has been measured;
-# afterwards the estimate is driven entirely by the learned per-moved-key rate.
-MIGRATION_COLD_START_HORIZON_SEC: float = float(os.getenv("MIGRATION_COLD_START_HORIZON_SEC", "30"))
-MIN_CHRONOS_PREDICTION_HORIZON: int = int(os.getenv("MIN_CHRONOS_PREDICTION_HORIZON", "10"))
 
 CoordHandler = Callable[[StreamWriter, bytes, concurrent.futures.ProcessPoolExecutor], Awaitable[None]]
 
@@ -307,28 +304,14 @@ class CoordinatorService:
     def _init_scaling_capacity_and_chronos(self) -> None:
         self.enable_autoscale: bool = bool(strtobool(os.getenv("ENABLE_AUTOSCALE", "true")))
         self.scale_cooldown_period: float = 30.0
-        self.capacity_confidence_threshold: float = 0.25
-        self.downscale_safety_factor: float = 0.90
         self._pending_downscale: bool = False
         self._downscale_victim_ids: set[int] = set()
 
-        self.last_scale_action_time: float = time.time()
         self.scale_window_seconds: int = 10
         self.epoch_duration_window = SlidingWindowMetric(self.scale_window_seconds)
         self.tps_sliding_window: SlidingWindowMetric = SlidingWindowMetric(self.scale_window_seconds)
 
-        self.sec_per_moved_key_ewma: float | None = None
-        self.sec_per_moved_key_ewma_alpha: float = 0.5
-        self._migration_keys_to_move: float = 0.0
-
-        self._last_action_was_downscale: bool = False
-        self._downscale_suppressed_until: float = 0.0
-        self._downscale_strikes: int = 0
-        self._downscale_penalty_base: float = self.scale_cooldown_period * 2
-        self._downscale_penalty_max: float = self.scale_cooldown_period * 30
-
         self.pid_controller = BacklogPIDController()
-        self._last_epoch_total_backlog: float = 0.0
         # Per-epoch accumulators: populated as each worker reports, consumed when all have synced
         self.epoch_backlog_accum: dict[int, float] = {}
         self.epoch_rate_accum: dict[int, float] = {}
@@ -338,9 +321,13 @@ class CoordinatorService:
         self.system_capacity_estimator: SystemCapacityEstimator = SystemCapacityEstimator(
             sequence_max_size=SEQUENCE_MAX_SIZE,
         )
-        self._capacity_ewma: float | None = None
-        self._capacity_ewma_alpha: float = 0.3  # smoothing factor (0→slow, 1→no smoothing)
-
+        self.scaling_policy = ScalingPolicy(
+            self.scale_cooldown_period,
+            self.pid_controller.backlog_threshold,
+            self.system_capacity_estimator,
+            self.tps_sliding_window,
+        )
+        self.migration_cost_model = MigrationCostModel()
         # Total live state keys across the cluster (refreshed each epoch sync).
         self.total_keys: int = 0
 
@@ -376,7 +363,7 @@ class CoordinatorService:
         effective_n_partitions = max(new_n_partitions, current_partitions)
         # Actual live operator partition count (basis for how many keys rehash);
         # captured before the graph update mutates it.
-        old_operator_partitions = self._graph_operator_partitions(self.coordinator.submitted_graph)
+        old_operator_partitions = MigrationCostModel.graph_operator_partitions(self.coordinator.submitted_graph)
 
         new_graph = deepcopy(self.coordinator.submitted_graph)
         new_graph.max_operator_parallelism = effective_n_partitions
@@ -421,7 +408,7 @@ class CoordinatorService:
         await self.coordinator.update_stateflow_graph(new_graph)
         # Keys actually rehashed to a new partition by this scale-up; used to
         # normalize the measured duration into a per-moved-key rate on completion.
-        self._migration_keys_to_move = self.total_keys * self._f_migrate(
+        self.migration_cost_model.migration_keys_to_move = self.total_keys * MigrationCostModel.f_migrate(
             old_operator_partitions,
             effective_n_partitions,
         )
@@ -430,26 +417,7 @@ class CoordinatorService:
         self.migration_start_time = start_time
         self.migration_start_count.inc()
         self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
-        self._note_scale_action(is_downscale=False)
-
-    def _note_scale_action(self, is_downscale: bool) -> None:
-        now = time.time()
-        if not is_downscale and self._last_action_was_downscale:
-            # scale-up is the first action after a scale-down => the down was wrong
-            self._downscale_strikes += 1
-            penalty = min(
-                self._downscale_penalty_base * (2 ** (self._downscale_strikes - 1)),
-                self._downscale_penalty_max,
-            )
-            self._downscale_suppressed_until = now + penalty
-            logging.warning(
-                f"DOWNSCALE | correction detected (strike #{self._downscale_strikes}); "
-                f"suppressing downscale for {penalty:.0f}s"
-            )
-        elif is_downscale and now > self._downscale_suppressed_until and self._last_action_was_downscale:
-            # long stretch with no correction -> forgive past strikes
-            self._downscale_strikes = 0
-        self._last_action_was_downscale = is_downscale
+        self.scaling_policy.note_scale_action(is_downscale=False)
 
     async def scale_down(self, workers_to_remove: int) -> None:
         """Scale down by removing *workers_to_remove* workers without changing
@@ -500,13 +468,13 @@ class CoordinatorService:
         )
         await self.coordinator.update_stateflow_graph(graph, include_all_live=True)
 
-        self._migration_keys_to_move = 0.0
+        self.migration_cost_model.migration_keys_to_move = 0.0
         start_time = time.time_ns()
         self.migration_start_time_gauge.set(start_time / 1_000_000)
         self.migration_start_time = start_time
         self.migration_start_count.inc()
         self.live_worker_count_gauge.set(n_live)
-        self._note_scale_action(is_downscale=True)
+        self.scaling_policy.note_scale_action(is_downscale=True)
 
     async def coordinator_controller(
         self,
@@ -577,9 +545,11 @@ class CoordinatorService:
         self.migration_in_progress = True
         await self.stop_snapshotting()
 
-        old_partitions = self._graph_operator_partitions(self.coordinator.submitted_graph)
-        new_partitions = self._graph_operator_partitions(graph)
-        self._migration_keys_to_move = self.total_keys * self._f_migrate(old_partitions, new_partitions)
+        old_partitions = MigrationCostModel.graph_operator_partitions(self.coordinator.submitted_graph)
+        new_partitions = MigrationCostModel.graph_operator_partitions(graph)
+        self.migration_cost_model.migration_keys_to_move = self.total_keys * MigrationCostModel.f_migrate(
+            old_partitions, new_partitions
+        )
 
         logging.warning(f"MIGRATION | START {graph}")
         await self.coordinator.update_stateflow_graph(graph)
@@ -993,194 +963,17 @@ class CoordinatorService:
                 smoothed_tps = self.tps_sliding_window.average() or 0.0
                 pid_output = self.pid_controller.compute(total_backlog, smoothed_tps)
                 if pid_output >= self.pid_controller.scale_up_threshold and not (
-                    time.time() - self.last_scale_action_time < self.scale_cooldown_period
+                    time.time() - self.scaling_policy.last_scale_action_time < self.scale_cooldown_period
                 ):
                     to_add = round(pid_output / self.pid_controller.scale_up_threshold)
-                    to_add = self._resolve_scale_up_workers(to_add)
+                    n_standby = self.coordinator.worker_pool.pending_standby_worker_count()
+                    to_add = self.scaling_policy.resolve_scale_up_workers(to_add, n_standby)
                     if to_add == 0:
-                        self.last_scale_action_time = time.time()
+                        self.scaling_policy.last_scale_action_time = time.time()
                         logging.warning("PID | no standby workers available, skipping scale up")
                         return
                     new_partition_num = len(self.coordinator.worker_pool.get_participating_workers()) + to_add
                     await self.scale_up(new_partition_num, to_add)
-
-    @staticmethod
-    def _f_migrate(n_partitions_old: int, n_partitions_new: int) -> float:
-        """Fraction of keys that change partition under hash repartitioning."""
-        if n_partitions_new > n_partitions_old:
-            return 1.0 - n_partitions_old / n_partitions_new
-        if n_partitions_new < n_partitions_old:
-            return 1.0 - n_partitions_new / n_partitions_old
-        return 0.0
-
-    @staticmethod
-    def _graph_operator_partitions(graph: StateflowGraph) -> int:
-        return max((op.n_partitions for op in graph.nodes.values()), default=1)
-
-    def _planned_partition_counts(self) -> tuple[int, int]:
-        """Pessimistic partition counts for the next possible scale-up."""
-        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
-        n_standby = self.coordinator.worker_pool.pending_standby_worker_count()
-        max_to_add = min(n_workers, n_standby) if n_standby > 0 else 0
-        if self.coordinator.graph_submitted and self.coordinator.submitted_graph is not None:
-            n_partitions_old = self._graph_operator_partitions(self.coordinator.submitted_graph)
-        else:
-            n_partitions_old = max(n_workers, 1)
-        n_partitions_new = n_workers + max_to_add
-        logging.warning(
-            f"PLANNED PARTITION COUNTS | n_partitions_old={n_partitions_old} | n_partitions_new={n_partitions_new}"
-        )
-        return n_partitions_old, n_partitions_new
-
-    def _expected_keys_to_move(self, total_keys: int) -> float:
-        """Keys expected to change partition for the next planned scale-up."""
-        n_partitions_old, n_partitions_new = self._planned_partition_counts()
-        return total_keys * self._f_migrate(n_partitions_old, n_partitions_new)
-
-    def _note_migration_duration(self, duration_sec: float) -> None:
-        """Fold a completed migration into the learned per-moved-key rate.
-
-        Normalizing by the number of keys actually moved lets a single learned
-        rate generalize across migration sizes and directions, so we no longer
-        depend on hand-tuned hashing/transfer constants.
-        """
-        keys_moved = self._migration_keys_to_move
-        if keys_moved <= 0:
-            # Nothing moved (e.g. same partition count) -> no rate signal.
-            return
-        sample = duration_sec / keys_moved
-        if self.sec_per_moved_key_ewma is None:
-            self.sec_per_moved_key_ewma = sample
-        else:
-            self.sec_per_moved_key_ewma += self.sec_per_moved_key_ewma_alpha * (sample - self.sec_per_moved_key_ewma)
-        logging.warning(
-            f"MIGRATION RATE | duration={duration_sec:.2f}s | keys_moved={keys_moved:.0f} | "
-            f"sample={sample * 1e6:.2f}us/key | ewma={self.sec_per_moved_key_ewma * 1e6:.2f}us/key",
-        )
-
-    def _estimate_migration_time(self, total_keys: int) -> float:
-        """Estimate the migration duration for the Chronos forecast horizon.
-
-        Uses a single empirically learned cost per key actually moved. Before
-        the first migration has been measured we fall back to a conservative
-        cold-start constant; after that the estimate is fully data-driven.
-        """
-        keys_to_move = self._expected_keys_to_move(total_keys)
-
-        if self.sec_per_moved_key_ewma is None or keys_to_move <= 0:
-            horizon = MIGRATION_COLD_START_HORIZON_SEC
-            logging.warning(
-                f"MIGRATION ESTIMATE | horizon={horizon:.2f}s (cold-start) | "
-                f"keys_to_move={keys_to_move:.0f} | learned_rate=None",
-            )
-        else:
-            horizon = self.sec_per_moved_key_ewma * keys_to_move
-            logging.warning(
-                f"MIGRATION ESTIMATE | horizon={horizon:.2f}s | keys_to_move={keys_to_move:.0f} | "
-                f"rate={self.sec_per_moved_key_ewma * 1e6:.2f}us/key",
-            )
-        return max(horizon, float(MIN_CHRONOS_PREDICTION_HORIZON))
-
-    def _resolve_scale_up_workers(self, to_add: int) -> int:
-        """Scale up only activates workers from _standby_queue; clamp and skip if none left.
-        Returns the number of workers to add.
-        """
-        n_standby = self.coordinator.worker_pool.pending_standby_worker_count()
-        if n_standby == 0:
-            self.last_scale_action_time = time.time()
-            logging.warning("SCALE UP | no standby workers available")
-            return 0
-        if to_add > n_standby:
-            logging.warning(f"SCALE UP | not enough standby workers clamping to {n_standby} workers")
-            return n_standby
-        return to_add
-
-    def _compute_predictive_upscaling(self, predictions: dict[str, list[float]]) -> tuple[bool, int]:
-        """Compare the Chronos forecast against the capacity model.
-        Returns (should_scale, workers_to_add).
-        """
-        # Check confidence before using capacity estimate
-        confidence = self.system_capacity_estimator.confidence
-        if confidence < self.capacity_confidence_threshold:
-            logging.warning(f"PREDICTIVE | low confidence={confidence:.2f}")
-            return False, 0
-
-        n_workers = len(self.coordinator.worker_pool.get_live_workers())
-        raw_capacity = self.system_capacity_estimator.estimate_system_capacity()
-        if raw_capacity is None or (time.time() - self.last_scale_action_time < self.scale_cooldown_period):
-            return False, 0
-        if self._capacity_ewma is None:
-            self._capacity_ewma = raw_capacity
-        else:
-            self._capacity_ewma += self._capacity_ewma_alpha * (raw_capacity - self._capacity_ewma)
-        system_capacity = self._capacity_ewma
-        peak_p75 = max(predictions.get("0.75", [0.0]))
-        headroom_factor = 1
-        effective_capacity = system_capacity * headroom_factor
-        logging.warning(
-            f"PREDICTIVE | confidence={confidence:.2f} | peak_p75={peak_p75:.0f} | "
-            f"raw_capacity={raw_capacity:.0f} | effective={effective_capacity:.0f}"
-        )
-        if peak_p75 <= effective_capacity:
-            return False, 0
-        per_worker_capacity = system_capacity / max(n_workers, 1)
-        n_needed = max(
-            n_workers + 1,
-            int(peak_p75 / (per_worker_capacity * headroom_factor)) + 1,
-        )
-
-        to_add = n_needed - n_workers
-        # scale_up only activates workers from _standby_queue; clamp and skip if none left
-        to_add = self._resolve_scale_up_workers(to_add)
-        if to_add <= 0:
-            return False, 0
-
-        logging.warning(f"PREDICTIVE | SCALE UP: need {n_needed} workers (currently {n_workers}, adding {to_add})")
-        return True, to_add
-
-    def _compute_predictive_downscaling(self, predictions: dict[str, list[float]] | None) -> tuple[bool, int]:
-        """Check if the system can serve predicted demand with fewer workers.
-        Returns (should_downscale, workers_to_remove).
-        """
-        if (
-            time.time() - self.last_scale_action_time < self.scale_cooldown_period
-            or self.migration_in_progress
-            or time.time() < self._downscale_suppressed_until
-        ):
-            return False, 0
-        n_workers = len(self.coordinator.worker_pool.get_live_workers())
-        # Backlog must be essentially zero before considering downscale,
-        # use value a little above zero to account for timing jitter on the worker side
-        if (
-            n_workers <= 1
-            or self._last_epoch_total_backlog >= self.pid_controller.backlog_threshold
-            or self._capacity_ewma is None
-        ):
-            return False, 0
-
-        # Determine peak expected demand (pessimistic: use current rate and p90 forecast)
-        peak_demand = self.tps_sliding_window.average() or 0.0
-        if predictions:
-            peak_demand = max(predictions.get("0.75", [0.0]))
-        if peak_demand <= 0:
-            return False, 0
-
-        # Can n workers handle peak demand with headroom?
-        to_remove = 0
-        for n in range(n_workers - 1, 1, -1):
-            capacity_n = self.system_capacity_estimator.capacity_for_workers(n)
-            if capacity_n is None:
-                break
-            estimated_capacity = capacity_n * self.downscale_safety_factor
-            logging.warning(f"SCALE DOWN: estimated_capacity={estimated_capacity:.0f} | peak_demand={peak_demand:.0f}")
-            if peak_demand < estimated_capacity:
-                logging.warning(f"SCALE DOWN: removing {n_workers - n} workers")
-                to_remove = n_workers - n
-            else:
-                break
-
-        perform_downscale = to_remove > 0
-        return perform_downscale, to_remove
 
     async def chronos_forecast_loop(self) -> None:
         """Periodically submit metric snapshots to the Chronos forecaster
@@ -1199,7 +992,18 @@ class CoordinatorService:
                 if not context:
                     continue
 
-                prediction_horizon = self._estimate_migration_time(self.total_keys)
+                n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+                n_standby = self.coordinator.worker_pool.pending_standby_worker_count()
+                graph = self.coordinator.submitted_graph
+                current_partitions = (
+                    MigrationCostModel.graph_operator_partitions(graph)
+                    if self.coordinator.graph_submitted and graph is not None
+                    else None
+                )
+
+                prediction_horizon = self.migration_cost_model.estimate_migration_time(
+                    self.total_keys, n_workers, n_standby, current_partitions
+                )
                 self.chronos_forecaster.submit(
                     context,
                     prediction_length=ceil(prediction_horizon),
@@ -1207,15 +1011,19 @@ class CoordinatorService:
                 predictions = self.chronos_forecaster.poll()
                 logging.warning(f"FORECAST | predictions: {predictions}")
                 if predictions and self.enable_autoscale and not self.migration_in_progress:
-                    should_scale, to_add = self._compute_predictive_upscaling(predictions)
-                    if should_scale and not (time.time() - self.last_scale_action_time < self.scale_cooldown_period):
-                        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+                    should_scale, to_add = self.scaling_policy.compute_predictive_upscaling(
+                        predictions, n_workers, n_standby
+                    )
+                    if should_scale and not (
+                        time.time() - self.scaling_policy.last_scale_action_time < self.scale_cooldown_period
+                    ):
                         new_partition_num = n_workers + to_add
                         await self.scale_up(new_partition_num, to_add)
-
                     elif not should_scale:
                         # Check for downscaling opportunity if we didn't scale up
-                        should_downscale, to_remove = self._compute_predictive_downscaling(predictions)
+                        should_downscale, to_remove = self.scaling_policy.compute_predictive_downscaling(
+                            predictions, n_workers, self.migration_in_progress
+                        )
                         if should_downscale:
                             await self.scale_down(to_remove)
             except asyncio.CancelledError:
@@ -1331,7 +1139,7 @@ class CoordinatorService:
             self.migration_end_count.inc()
             migration_duration = (self.migration_end_time - self.migration_start_time) / 1_000_000_000
             logging.warning(f"MIGRATION_DURATION: {migration_duration:.2f} s")
-            self._note_migration_duration(migration_duration)
+            self.migration_cost_model.note_migration_duration(migration_duration)
             await self.migration_metadata.cleanup(mt)
             self.migration_in_progress = False
 
@@ -1349,7 +1157,7 @@ class CoordinatorService:
                 self._downscale_victim_ids.clear()
                 self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
 
-            self.last_scale_action_time = time.time()
+            self.scaling_policy.last_scale_action_time = time.time()
             logging.warning("Restarting the snapshotting mechanism")
             self.snapshotting_task = asyncio.create_task(self.send_snapshot_marker())
 
@@ -1690,7 +1498,7 @@ class CoordinatorService:
         logging.warning("Coordinator Snapshotting online")
 
         if self.enable_autoscale:
-            from coordinator.chronos_forecaster import ChronosForecaster
+            from autoscaler.chronos_forecaster import ChronosForecaster
 
             self.chronos_forecaster = ChronosForecaster()
             self.chronos_forecaster.start()

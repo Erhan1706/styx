@@ -147,9 +147,9 @@ class SystemCapacityEstimator:
         return per_worker_cap * n_workers
 
     def observe_saturated_capacity(self, n_workers: int, achieved_tps: float) -> None:
-        """Fold an observed *saturated* system TPS into the per-N capacity table.
+        """Add an observed saturated system TPS into the per-N capacity table.
         Should only be called by the coordinator when the cluster is actually the
-        bottleneck (non-trivial backlog, not migrating), so achieved TPS ~= capacity.
+        bottleneck (backlog high, not migrating), so achieved TPS ~= capacity.
         """
         if n_workers <= 0 or achieved_tps <= 0:
             return
@@ -160,12 +160,7 @@ class SystemCapacityEstimator:
             self._capacity_by_n[n_workers] = current + self._capacity_by_n_alpha * (achieved_tps - current)
 
     def capacity_for_workers(self, n_workers: int) -> float | None:
-        """Best estimate of total system TPS achievable with `n_workers`.
-
-        Priority: oracle table -> learned saturated value for this exact N ->
-        sub-linear extrapolation from the nearest learned N -> median per-worker
-        scaling as a last resort.
-        """
+        """Best estimate of total system TPS achievable with n_workers"""
         if n_workers <= 0:
             return None
 
@@ -185,7 +180,7 @@ class SystemCapacityEstimator:
 
     @property
     def confidence(self) -> float:
-        """System-level confidence as the minimum worker confidence."""
+        """System-level confidence as the minimum worker confidence"""
         if not self._models:
             return 0.0
 

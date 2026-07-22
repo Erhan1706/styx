@@ -1,7 +1,8 @@
 """Unit tests for coordinator/aria_sync_metadata.py"""
 
-from coordinator.aria_sync_metadata import AriaSyncMetadata
 from styx.common.message_types import MessageType
+
+from coordinator.aria_sync_metadata import AriaSyncMetadata
 
 # ---------------------------------------------------------------------------
 # check_distributed_barrier
