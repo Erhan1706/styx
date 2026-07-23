@@ -1,14 +1,34 @@
 from pathlib import Path
+import math
 
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib import rcParams
-from matplotlib.ticker import EngFormatter
+from matplotlib.ticker import EngFormatter, MultipleLocator
 
 from plot_common import load_metadata, plot_migrations
 
 rcParams["figure.figsize"] = [14, 4]
 plt.rcParams.update({"font.size": 22})
+
+
+def _worker_tick_step(max_workers: int) -> int:
+    if max_workers <= 4:
+        return 1
+    if max_workers <= 12:
+        return 2
+    if max_workers <= 25:
+        return 5
+    if max_workers <= 50:
+        return 10
+    return 20
+
+
+def _worker_y_upper(max_workers: int) -> int:
+    step = _worker_tick_step(max_workers)
+    if max_workers <= 0:
+        return step
+    return max(step, math.ceil(max_workers / step) * step)
 
 
 def _get_client_t0_ms(run_path: Path) -> float:
@@ -64,6 +84,8 @@ def _plot_prometheus_metric(
     x_max_seconds: float | None = None,
     save_path: Path | str | None = None,
     show: bool = False,
+    y_integer_ticks: bool = False,
+    legend_loc: str = "upper right",
 ) -> tuple[plt.Figure, plt.Axes]:
     run_path = Path(run_path)
     warmup_seconds, migrations = load_metadata(run_path)
@@ -92,8 +114,6 @@ def _plot_prometheus_metric(
     aligned = _align_to_workload_time(series, t0_ms, warmup_seconds, x_max_seconds)
 
     ax.plot(
-        #[0, 20, 30, 40, 50, 60, 75, 100, 110, 125, 140, 150, 170, 185, 200],
-        #[1, 2, 3, 4, 5, 6, 6, 6, 5, 3, 2, 1, 2, 4, 4],
         aligned["time_shifted"],
         aligned["value"],
         label=label,
@@ -101,8 +121,14 @@ def _plot_prometheus_metric(
         color=color,
     )
 
+    ax.tick_params(axis='both', labelsize=24)
     ax.set_ylabel(ylabel)
-    ax.yaxis.set_major_formatter(EngFormatter(sep=""))
+    if y_integer_ticks:
+        ymax = int(aligned["value"].max())
+        step = _worker_tick_step(ymax)
+        ax.yaxis.set_major_locator(MultipleLocator(step))
+    else:
+        ax.yaxis.set_major_formatter(EngFormatter(sep=""))
     ax.grid(linestyle="dotted", linewidth=1.5, axis="y")
 
     if x_max_seconds is not None:
@@ -115,9 +141,12 @@ def _plot_prometheus_metric(
 
     if show_migrations:
         plot_migrations(ax, migrations, t0_ms, warmup_seconds)
+    elif y_integer_ticks:
+        ymax = int(aligned["value"].max())
+        ax.set_ylim(0, _worker_y_upper(ymax) + 1)
     else:
         ax.set_ylim(0, aligned["value"].max() + 1)
-    ax.legend(loc="upper right")
+    ax.legend(loc=legend_loc)
 
     if save_path is not None:
         fig.savefig(save_path)
@@ -145,6 +174,7 @@ def plot_workers(
         x_max_seconds=x_max_seconds,
         save_path=save_path,
         show=show,
+        y_integer_ticks=True,
     )
 
 

@@ -21,7 +21,7 @@ async def create(ctx: StatefulFunction, cap: int):
 @hotel_operator.register
 async def reserve(ctx: StatefulFunction):
     hotel_data = ctx.get()
-    hotel_data['Cap'] -= 1
+    # hotel_data['Cap'] -= 1
     if hotel_data["Cap"] < 0:
         raise NotEnoughSpace(f"Not enough space: for hotel: {ctx.key}")
     ctx.put(hotel_data)

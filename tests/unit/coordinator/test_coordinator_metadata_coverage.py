@@ -168,18 +168,32 @@ class TestCreateKafkaIngressTopics:
         c.kafka_metadata_producer = MagicMock()
         graph = _graph()
 
-        with patch("coordinator.coordinator_metadata.AdminClient") as MockAdmin:
+        with (
+            patch("coordinator.coordinator_metadata.AdminClient") as MockAdmin,
+            patch("coordinator.coordinator_metadata.asyncio.sleep", new_callable=AsyncMock),
+        ):
             mock_admin = MagicMock()
             MockAdmin.return_value = mock_admin
 
+            from confluent_kafka import KafkaError
             from confluent_kafka.admin import KafkaException
 
-            f = MagicMock()
-            f.result.side_effect = KafkaException(MagicMock())
-            mock_admin.create_topics.return_value = {"users": f}
+            topic_futures = {}
+            for topic_name in ["styx-metadata", "sequencer-wal", "users", "users--OUT"]:
+                f = MagicMock()
+                if topic_name == "users":
+                    # Transient failure: retried once, then succeeds
+                    retriable = MagicMock()
+                    retriable.code.return_value = KafkaError.UNKNOWN
+                    f.result.side_effect = [KafkaException(retriable), None]
+                else:
+                    f.result.return_value = None
+                topic_futures[topic_name] = f
+            mock_admin.create_topics.return_value = topic_futures
 
-            # Should not raise, just log
             await c.create_kafka_ingress_topics(graph)
+
+            assert mock_admin.create_topics.call_count == 2
 
     @pytest.mark.asyncio
     async def test_starts_metadata_producer_if_none(self):

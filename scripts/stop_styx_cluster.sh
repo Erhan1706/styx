@@ -8,7 +8,7 @@ export STYX_WORKER_THREADS="$threads_per_worker"
 dir_location="logs"
 mkdir -p "$dir_location"
 
-# One file per scaled worker replica (compose logs worker merges all replicas).
+# One file per scaled worker replica
 for cid in $(docker compose ps -a -q worker 2>/dev/null); do
   cname=$(docker inspect --format '{{.Name}}' "$cid" | sed 's|^/||')
   docker logs "$cid" 2>&1 | grep -v '|[[:space:]]*$' > "${dir_location}/${cname}-logs-${TS}.log"

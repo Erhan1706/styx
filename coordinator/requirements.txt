@@ -13,5 +13,4 @@ confluent-kafka==2.14.0
 boto3==1.43.7
 # deathstar
 geopy
-# chronos
 chronos-forecasting==2.2.2

@@ -6,7 +6,7 @@ epoch_size=$2
 threads_per_worker=$3
 enable_compression=$4
 use_composite_keys=$5
-enable_autoscale=${6:-true}
+enable_autoscale=${6:-false}
 minimum_amount_of_workers=1
 
 echo "============== Starting Styx Cluster ================"
@@ -24,7 +24,7 @@ threaded_scale_factor=$(( (scale_factor + threads_per_worker - 1) / threads_per_
 echo "threaded_scale_factor: $threaded_scale_factor"
 echo "====================================================="
 
-#docker system prune -f --volumes >/dev/null 
+docker system prune -f --volumes >/dev/null 
 
 # START NEW DEPLOYMENT
 docker compose -f docker-compose-kafka.yml up -d >/dev/null
@@ -33,7 +33,6 @@ docker compose -f docker-compose-s3.yml up -d >/dev/null
 sleep 10
 export STYX_WORKER_THREADS="$threads_per_worker"
 export ENABLE_AUTOSCALE="$enable_autoscale"
-# Enable BuildKit for cache mount support
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 docker compose build \

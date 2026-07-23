@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaConnectionError
+from confluent_kafka import KafkaError
 from confluent_kafka.admin import AdminClient, KafkaException, NewPartitions, NewTopic
 from setuptools._distutils.util import strtobool
 from snapshot_compactor import start_snapshot_compaction
@@ -246,7 +247,6 @@ class Coordinator:
                     operator_copy,
                 )
         worker_assignments = self.worker_pool.get_worker_assignments()
-        logging.warning(f"WORKER ASSIGNMENTS: {worker_assignments}")
 
         if include_all_live:
             targets = self.worker_pool.get_live_workers()
@@ -283,8 +283,7 @@ class Coordinator:
 
     def reschedule_all_partitions_round_robin(self, stateflow_graph: StateflowGraph) -> None:
         """
-        Clears all current assignments and reschedules *all* operator partitions (including shadow ones)
-        across all live workers.
+        Clears all current assignments and reschedules all operator partitions across all live workers.
         """
         live_workers = self.worker_pool.get_live_workers()
         logging.warning(f"Number of live workers: {len(live_workers)}")
@@ -311,9 +310,6 @@ class Coordinator:
         for operator_name, operator in iter(stateflow_graph):
             for partition in range(self.max_operator_parallelism):
                 operator_copy = deepcopy(operator)
-                # Also add the shadow partitions n_partitions - max parallelism
-                # if partition >= operator.n_partitions:
-                #    operator_copy.make_shadow()
                 self.worker_pool.schedule_operator_partition(
                     (operator_name, partition),
                     operator_copy,
@@ -345,30 +341,6 @@ class Coordinator:
             "styx-metadata",
             key=metadata_key,
             value=serialized_graph,
-        )
-
-    async def rebalance_cluster(self) -> None:
-        """
-        Redistribute operator partitions across all *live* workers.
-
-        This is meant for manual scaling experiments: after you add/remove workers, call this
-        to trigger an InitRecovery from the latest completed snapshot with a new assignment.
-        """
-        if not self.graph_submitted or self.submitted_graph is None:
-            logging.warning("Rebalance requested but no graph is currently submitted.")
-            return
-
-        snap_id = self.get_current_completed_snapshot_id()
-        if snap_id < 0:
-            logging.warning("Rebalance requested but no completed snapshot is available yet.")
-            return
-
-        self.reschedule_all_partitions_round_robin(self.submitted_graph)
-
-        logging.warning(
-            f"Rebalance | live_workers={len(self.worker_pool.get_live_workers())} "
-            f"participating={len(self.worker_pool.get_participating_workers())} "
-            f"snapshot_id={snap_id}"
         )
 
     async def expand_kafka_topic_partitions(self, stateflow_graph: StateflowGraph, new_partition_count: int) -> None:
@@ -405,16 +377,17 @@ class Coordinator:
     async def create_kafka_ingress_topics(self, stateflow_graph: StateflowGraph) -> None:
         if KAFKA_URL is None:
             logging.error("Kafka URL not given")
+
+        client = AdminClient({"bootstrap.servers": KAFKA_URL})
         while True:
             try:
-                client = AdminClient({"bootstrap.servers": KAFKA_URL})
+                client.list_topics(timeout=5)
                 break
             except KafkaException:
                 logging.warning(
                     f"Kafka at {KAFKA_URL} not ready yet, sleeping for 1 second",
                 )
                 await asyncio.sleep(1)
-
         topics = (
             [
                 NewTopic(
@@ -448,15 +421,27 @@ class Coordinator:
             ]
         )
 
-        futures = client.create_topics(topics)
-        for topic, future in futures.items():
-            try:
-                future.result()
-                logging.warning(
-                    f"Topic {topic} created with {self.max_operator_parallelism} partitions "
-                    f"and replication factor of {KAFKA_REPLICATION_FACTOR}",
-                )
-            except KafkaException as e:
-                logging.warning(f"Failed to create topic {topic}: {e}")
+        pending = {topic.topic: topic for topic in topics}
+        while pending:
+            futures = client.create_topics(list(pending.values()))
+            failed: dict[str, NewTopic] = {}
+            for topic, future in futures.items():
+                try:
+                    future.result()
+                    logging.warning(
+                        f"Topic {topic} created with {self.max_operator_parallelism} partitions "
+                        f"and replication factor of {KAFKA_REPLICATION_FACTOR}",
+                    )
+                except KafkaException as e:
+                    # A topic that already exists is fine (idempotent creation).
+                    if e.args and e.args[0].code() == KafkaError.TOPIC_ALREADY_EXISTS:
+                        logging.warning(f"Topic {topic} already exists")
+                        continue
+                    logging.warning(f"Failed to create topic {topic}, will retry: {e}")
+                    failed[topic] = pending[topic]
+            pending = failed
+            if not pending:
+                break
+            await asyncio.sleep(1)
         if self.kafka_metadata_producer is None:
             await self.start_kafka_metadata_producer()

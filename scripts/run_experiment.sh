@@ -118,6 +118,8 @@ fi
 
 if [[ $workload_name == "ycsbt" ]]; then
     # YCSB-T
+    # To check if the state is correct within Styx, expensive to run together with large scale experiments, use for debug
+    # values true | false
     run_with_validation=false
     python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "dhr" ]]; then
@@ -167,8 +169,7 @@ if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; th
         sudo kill "$KUBEFWD_PID" 2>/dev/null || true
         unset KUBEFWD_PID
     fi
-    #bash scripts/uninstall_styx_cluster_with_helm.sh
+    bash scripts/uninstall_styx_cluster_with_helm.sh
 else
-    #bash scripts/stop_styx_cluster.sh "$styx_threads_per_worker"
-    docker compose stop coordinator worker 
+    bash scripts/stop_styx_cluster.sh "$styx_threads_per_worker"
 fi

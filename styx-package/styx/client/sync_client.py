@@ -70,10 +70,10 @@ class SyncStyxClient(BaseStyxClient):
         self.kafka_producer_config = {
             "bootstrap.servers": self._kafka_url,
             "acks": "all",
-            "linger.ms": 5,
+            "linger.ms": 0,
             "compression.type": "none",
             "enable.idempotence": True,
-            "max.in.flight.requests.per.connection": 3,
+            "max.in.flight.requests.per.connection": 1,
             "client.id": str(uuid.uuid4()),
             "metadata.max.age.ms": 5000,  # Refresh metadata every 5s for scale-up support
         }
@@ -194,7 +194,7 @@ class SyncStyxClient(BaseStyxClient):
                     operator_name,
                     actual_partitions if operator_name in md.topics else 0,
                 )
-                time.sleep(0.5)
+                time.sleep(1)
 
     def start_consuming_metadata(self) -> None:
         """Consumes metadata from Kafka and updates the current graph.

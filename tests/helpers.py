@@ -1,9 +1,13 @@
 import contextlib
 import os
+from pathlib import Path
+import re
 import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 
 # S3 defaults for local development (RustFS via docker-compose-s3.yml).
 _S3_DEFAULTS = {
@@ -27,6 +31,17 @@ def make_test_env() -> dict:
     return env
 
 
+def resolve_run_dir(results_dir: Path) -> Path:
+    results_dir = Path(results_dir)
+    if (results_dir / "client_requests.csv").exists():
+        return results_dir
+
+    subdirs = [p for p in results_dir.iterdir() if p.is_dir()] if results_dir.is_dir() else []
+    if not subdirs:
+        raise AssertionError(f"No artifacts and no run sub-directory under {results_dir}")
+    return max(subdirs, key=lambda p: p.stat().st_mtime)
+
+
 def wait_port(host: str, port: int, timeout_s: float = 120.0) -> None:
     deadline = time.time() + timeout_s
     last_err = None
@@ -38,6 +53,53 @@ def wait_port(host: str, port: int, timeout_s: float = 120.0) -> None:
             last_err = e
             time.sleep(0.5)
     raise TimeoutError(f"Timed out waiting for {host}:{port} (last error: {last_err})")
+
+
+COORDINATOR_METRICS_URL = "http://localhost:8000/metrics"
+_LIVE_WORKERS_RE = re.compile(r"^live_worker_count\s+([0-9.eE+-]+)$", re.MULTILINE)
+
+
+def wait_for_workers(
+    expected: int,
+    *,
+    metrics_url: str = COORDINATOR_METRICS_URL,
+    timeout_s: float = 300.0,
+    log=None,
+) -> None:
+    """Block until the coordinator reports at least *expected* registered workers.
+
+    The demo clients publish their initial state to S3 as snapshot 0 and then send
+    InitDataComplete, which only promotes workers the coordinator already knows about.
+    A client that starts before the workers have registered therefore has its
+    notification silently dropped, and every worker boots with empty state, so waiting
+    for the coordinator port alone is not enough.
+    """
+    deadline = time.time() + timeout_s
+    last_seen: float | None = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(metrics_url, timeout=5) as resp:  # noqa: S310
+                body = resp.read().decode("utf-8", errors="replace")
+        except OSError, urllib.error.URLError:
+            time.sleep(1)
+            continue
+
+        match = _LIVE_WORKERS_RE.search(body)
+        if match is not None:
+            last_seen = float(match.group(1))
+            if last_seen >= expected:
+                if log is not None:
+                    log.info("Coordinator reports %s registered worker(s).", int(last_seen))
+                return
+        if log is not None:
+            log.info("Waiting for %s workers to register (coordinator reports %s)...", expected, last_seen)
+        time.sleep(1)
+
+    raise TimeoutError(
+        f"Timed out after {timeout_s}s waiting for {expected} workers to register "
+        f"(coordinator last reported {last_seen}). Starting the client now would lose "
+        f"the InitDataComplete notification and leave every worker with empty state.",
+    )
 
 
 def run_and_stream(cmd, *, cwd: str, env: dict, timeout: float, banner: str, log):

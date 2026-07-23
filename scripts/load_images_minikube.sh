@@ -20,9 +20,5 @@ fi
 
 "$ROOT_DIR/scripts/build_local_images.sh"
 
-#echo "Loading images into minikube..."
-#minikube  image load "${COORDINATOR_IMAGE}:${TAG}"
-#minikube  image load "${WORKER_IMAGE}:${TAG}"
-
 echo "Done. Images available in minikube:"
 minikube image list

@@ -1,7 +1,7 @@
 import asyncio
 from collections import defaultdict
 import contextlib
-from dataclasses import astuple
+from dataclasses import astuple, dataclass
 import os
 import time
 from timeit import default_timer as timer
@@ -44,14 +44,36 @@ CONFLICT_DETECTION_METHOD: AriaConflictDetectionType = AriaConflictDetectionType
 )
 # if more than 10% aborts use fallback strategy
 FALLBACK_STRATEGY_PERCENTAGE: float = float(
-    os.getenv("FALLBACK_STRATEGY_PERCENTAGE", "0.1"),
+    os.getenv("FALLBACK_STRATEGY_PERCENTAGE", "-0.1"),
 )
 SNAPSHOTTING_THREADS: int = int(os.getenv("SNAPSHOTTING_THREADS", "4"))
 SEQUENCE_MAX_SIZE: int = int(os.getenv("SEQUENCE_MAX_SIZE", "1_000"))
 KAFKA_URL: str = os.environ["KAFKA_URL"]
 USE_ASYNC_MIGRATION: bool = bool(strtobool(os.getenv("USE_ASYNC_MIGRATION", "true")))
-ASYNC_MIGRATION_BATCH_SIZE: int = int(os.getenv("ASYNC_MIGRATION_BATCH_SIZE", "2000"))
+ASYNC_MIGRATION_BATCH_SIZE: int = int(os.getenv("ASYNC_MIGRATION_BATCH_SIZE", "2_000"))
 EPOCH_INTERVAL_MS: int = int(os.getenv("EPOCH_INTERVAL_MS", "10"))
+
+
+@dataclass(frozen=True)
+class _EpochTimings:
+    """Wall-clock durations (ms) of each phase within a single epoch."""
+
+    wal_ms: float
+    func_ms: float
+    chain_ms: float
+    sync_ms: float
+    conflict_res_ms: float
+    commit_ms: float
+    fallback_ms: float
+    snap_ms: float
+
+    @property
+    def cpu_work_ms(self) -> float:
+        return self.func_ms + self.conflict_res_ms + self.commit_ms + self.fallback_ms
+
+    @property
+    def io_wait_ms(self) -> float:
+        return self.chain_ms + self.wal_ms + self.snap_ms + self.sync_ms
 
 
 class AriaProtocol(BaseTransactionalProtocol):
@@ -521,9 +543,7 @@ class AriaProtocol(BaseTransactionalProtocol):
     async def handle_async_migration(self, data: bytes) -> None:
         # Lock-free: no awaits.
         operator_partition, batch = self.networking.decode_message(data)
-        logging.warning(
-            f"ASYNC_MIGRATION | Worker {self.id} | Received batch for {operator_partition} | {len(batch)} keys"
-        )
+        logging.debug(f"MIGRATION | Worker {self.id} | Received batch for {operator_partition} | {len(batch)} keys")
 
         self.local_state.set_batch_data_from_migration(operator_partition, batch)
         # Unblock any transactions waiting for these keys via RequestRemoteKey
@@ -605,7 +625,6 @@ class AriaProtocol(BaseTransactionalProtocol):
                             f"MIGRATION_FINISHED at epoch: {self.sequencer.epoch_counter}"
                             f" at time: {time.time_ns() // 1_000_000}",
                         )
-                        self.local_state.log_state_summary(self.id, context="MIGRATION COMPLETE (async transfer done)")
                         return
                     # keys_to_send dict is empty but keys_remaining_to_send > 0
                     # shouldn't normally happen, but yield and retry
@@ -647,70 +666,52 @@ class AriaProtocol(BaseTransactionalProtocol):
 
         await self.stop()
 
-    # TODO: refactor this function to be more readable
-    async def _process_epoch(self, sequence: list[SequencedItem]) -> None:  # noqa: PLR0915 temporary ignore
+    async def _process_epoch(self, sequence: list[SequencedItem]) -> None:
         epoch_start = timer()
 
         sequence = await self._redirect_migration_backlog_transactions(sequence)
-
-        # Calculate idle time: time spent waiting since last epoch ended
-        idle_end = timer()
-        idle_start = self._last_epoch_end_time or idle_end
-        self._idle_time_ms = (idle_end - idle_start) * 1000  # Convert to ms
-        # Track if this is an empty epoch (no local work, just sync)
-        self._empty_epoch = not bool(sequence)
 
         self.currently_processing = True
         logging.warning(f"{self.id} ||| Epoch: {self.sequencer.epoch_counter} running {len(sequence)} functions...")
         self.phase_resource_tracker.reset_epoch()
 
-        timings = await self._run_epoch_functions_and_chain(sequence)
-        logging.debug(f"Finished running {len(sequence)} functions")
-
-        sync_time = 0.0
+        run_timings = await self._run_epoch_functions_and_chain(sequence)
         # Capture local logic aborts before sync overwrites with global
         logic_aborts_count = len(self.networking.logic_aborts_everywhere)
-        sync_time += await self._sync_processing_done()
-        logging.debug("Finished syncing processing")
+        sync_time = await self._sync_processing_done()
 
-        conflict_resolution_start = timer()
+        conflict_res_start = timer()
         self.phase_resource_tracker.begin("Conflict Resolution")
         # HERE WE KNOW ALL THE LOGIC ABORTS
-        self.local_state.remove_aborted_from_rw_sets(
-            self.networking.logic_aborts_everywhere,
-        )
+        self.local_state.remove_aborted_from_rw_sets(self.networking.logic_aborts_everywhere)
         concurrency_aborts = await self._compute_concurrency_aborts()
         self.phase_resource_tracker.end("Conflict Resolution")
-        conflict_resolution_end = timer()
-        logging.debug("Finished conflict resolution")
+        conflict_res_time = (timer() - conflict_res_start) * 1000
         local_abort_rate = (len(concurrency_aborts) / len(sequence)) if sequence else 0.0
 
         # Notify peers that we are ready to commit
         sync_time += await self._sync_commit(sequence, concurrency_aborts)
-        logging.debug("Finished syncing commit")
+
         # HERE WE KNOW ALL THE CONCURRENCY ABORTS
         commit_start = timer()
         self.phase_resource_tracker.begin("Commit time")
         self._commit_and_prepare_responses(sequence)
         await self.send_delta_to_snapshotting_proc()
         self.phase_resource_tracker.end("Commit time")
-        commit_end = timer()
-        logging.debug("Finished commit")
+        commit_time = (timer() - commit_start) * 1000
         # Track lock-free vs fallback commits
         local_concurrency_aborted = {
             seq_i.t_id for seq_i in sequence if seq_i.t_id in self.concurrency_aborts_everywhere
         }
-        local_aborted_t_ids = {seq_i.t_id for seq_i in sequence if seq_i.t_id in self.concurrency_aborts_everywhere}
-        committed_lock_free = len(sequence) - len(local_aborted_t_ids)
+        committed_lock_free = len(sequence) - len(local_concurrency_aborted)
 
         fallback_start = timer()
         self.phase_resource_tracker.begin("Fallback")
         _, committed_fallback = await self._maybe_run_fallback()
         self.phase_resource_tracker.end("Fallback")
-        fallback_end = timer()
-        logging.debug("Finished fallback")
-        self._advance_offsets(sequence)
+        fallback_time = (timer() - fallback_start) * 1000
 
+        self._advance_offsets(sequence)
         self.sequencer.increment_epoch(self.max_t_counter, self.t_ids_to_reschedule)
         await self.wait_responses_to_be_sent.wait()
         self.cleanup_after_epoch()
@@ -719,103 +720,113 @@ class AriaProtocol(BaseTransactionalProtocol):
         self.phase_resource_tracker.begin("Async Snapshot")
         await self.take_snapshot()
         self.phase_resource_tracker.end("Async Snapshot")
-        snap_end = timer()
+        snap_time = (timer() - snap_start) * 1000
 
-        epoch_end = timer()
+        epoch_latency = max(round((timer() - epoch_start) * 1000, 4), 1)
+        timings = _EpochTimings(
+            wal_ms=round(run_timings["wal_ms"], 4),
+            func_ms=round(run_timings["func_ms"], 4),
+            chain_ms=round(run_timings["chain_ms"], 4),
+            sync_ms=sync_time,
+            conflict_res_ms=conflict_res_time,
+            commit_ms=commit_time,
+            fallback_ms=fallback_time,
+            snap_ms=snap_time,
+        )
+        worker_epoch_stats = self._build_worker_epoch_stats(
+            total_txns=len(sequence),
+            committed_lock_free=committed_lock_free,
+            committed_fallback=committed_fallback,
+            concurrency_aborts_count=len(local_concurrency_aborted),
+            logic_aborts_count=logic_aborts_count,
+            local_abort_rate=local_abort_rate,
+            epoch_latency=epoch_latency,
+            timings=timings,
+        )
+        self._log_epoch_summary(worker_epoch_stats)
 
-        # Transaction count metrics for this epoch
-        total_txns = len(sequence)
-        committed_txns = committed_lock_free + committed_fallback
-        concurrency_aborts_count = len(local_concurrency_aborted)
+        await self._sync_cleanup(worker_epoch_stats)
+        self._last_epoch_end_time = timer()
 
-        epoch_latency = max(round((epoch_end - epoch_start) * 1000, 4), 1)
-        epoch_throughput = (committed_txns * 1000) // epoch_latency  # TPS
-        input_rate = self.ingress.epoch_stats["consumed"]
-
+    def _build_operator_epoch_stats(self, epoch_latency: float) -> list[tuple[str, int, float, float, int]]:
+        """Aggregate per-function operator metrics into per-partition stats and reset them."""
         operator_agg: dict[tuple[str, int], dict[str, float | int]] = {}
         for (op_name, partition, _func_name), m in self.operator_metrics.items():
-            key = (op_name, partition)
-            agg = operator_agg.setdefault(key, {"calls": 0, "sum_ms": 0.0})
+            agg = operator_agg.setdefault((op_name, partition), {"calls": 0, "sum_ms": 0.0})
             agg["calls"] += m["count"]
             agg["sum_ms"] += m["sum_ms"]
 
-        operator_epoch_stats: list[tuple[str, int, float, float, int]] = []
         epoch_seconds = max(epoch_latency / 1000.0, 1e-6)
+        operator_epoch_stats: list[tuple[str, int, float, float, int]] = []
         for (op_name, partition), agg in operator_agg.items():
             call_count = int(agg["calls"])
             if call_count == 0:
                 continue
-            total_latency_ms = float(agg["sum_ms"])
-            avg_latency_ms = total_latency_ms / call_count
+            avg_latency_ms = float(agg["sum_ms"]) / call_count
             tps = call_count / epoch_seconds
             operator_epoch_stats.append((op_name, partition, tps, avg_latency_ms, call_count))
 
-        # Reset per-epoch operator metrics after epoch
+        # Reset per-epoch operator metrics after aggregating
         self.operator_metrics.clear()
-        phase_resources = self.phase_resource_tracker.export()
+        return operator_epoch_stats
 
-        func_time = round(timings["func_ms"], 4)
-        chain_time = round(timings["chain_ms"], 4)
-        fallback_time = (fallback_end - fallback_start) * 1000
-        conflict_resolution_time = (conflict_resolution_end - conflict_resolution_start) * 1000
-        commit_time = (commit_end - commit_start) * 1000
-        wal_time = round(timings["wal_ms"], 4)
-        snap_time = (snap_end - snap_start) * 1000
-
-        cpu_work_ms = func_time + conflict_resolution_time + commit_time + fallback_time
-        io_wait_time_ms = chain_time + wal_time + snap_time + sync_time
-        # ratio of processing time to total time
-        cpu_utilization = (cpu_work_ms / epoch_latency) if epoch_latency > 0 else 0.0
-        # ratio of IO wait time to total time
-        io_wait_utilization = (io_wait_time_ms / epoch_latency) if epoch_latency > 0 else 0.0
-        key_counts = sum(len(data) for data in self.local_state.data.values())
-
-        logging.warning(f"Epoch throughput: {epoch_throughput} | Latency: {epoch_latency} ms")
-        logging.warning(f"Queue backlog: {len(self.sequencer.distributed_log)}")
-        if total_txns > 0:
-            logging.warning(f"Per txn cost: {epoch_latency / total_txns} ms")
-
-        worker_epoch_stats = WorkerEpochStats(
+    def _build_worker_epoch_stats(
+        self,
+        *,
+        total_txns: int,
+        committed_lock_free: int,
+        committed_fallback: int,
+        concurrency_aborts_count: int,
+        logic_aborts_count: int,
+        local_abort_rate: float,
+        epoch_latency: float,
+        timings: _EpochTimings,
+    ) -> WorkerEpochStats:
+        """Assemble the per-epoch stats reported to the coordinator."""
+        committed_txns = committed_lock_free + committed_fallback
+        return WorkerEpochStats(
             worker_id=self.id,
-            epoch_throughput=epoch_throughput,
+            epoch_throughput=(committed_txns * 1000) // epoch_latency,  # TPS
             epoch_latency=epoch_latency,
             local_abort_rate=local_abort_rate,
-            wal_time=wal_time,
-            func_time=func_time,
-            chain_ack_time=chain_time,
-            sync_time=sync_time,
-            conflict_res_time=conflict_resolution_time,
-            commit_time=commit_time,
-            fallback_time=fallback_time,
-            snap_time=snap_time,
-            input_rate=input_rate,
+            wal_time=timings.wal_ms,
+            func_time=timings.func_ms,
+            chain_ack_time=timings.chain_ms,
+            sync_time=timings.sync_ms,
+            conflict_res_time=timings.conflict_res_ms,
+            commit_time=timings.commit_ms,
+            fallback_time=timings.fallback_ms,
+            snap_time=timings.snap_ms,
+            input_rate=self.ingress.epoch_stats["consumed"],
             queue_backlog=len(self.sequencer.distributed_log),
-            idle_time_ms=round(self._idle_time_ms, 4),
             total_txns=total_txns,
             committed_txns=committed_txns,
             logic_aborts=logic_aborts_count,
             concurrency_aborts=concurrency_aborts_count,
             committed_lock_free=committed_lock_free,
             committed_fallback=committed_fallback,
-            empty_epoch=self._empty_epoch,
-            cpu_utilization=cpu_utilization,
-            io_wait_utilization=io_wait_utilization,
-            operator_epoch_stats=operator_epoch_stats,
-            phase_resources=phase_resources,
-            key_counts=key_counts,
-        )
-        logging.debug(
-            f"{self.id} ||| Epoch: {self.sequencer.epoch_counter - 1} done in "
-            f"{epoch_latency}ms "
-            f"global logic aborts: {len(self.networking.logic_aborts_everywhere)} "
-            f"concurrency aborts for next epoch: {len(self.concurrency_aborts_everywhere)} "
-            f"commited transactions: {committed_txns} "
-            f"total transactions: {total_txns} "
-            f"sequencer backlog: {len(self.sequencer.distributed_log)} "
+            # ratio of processing / IO-wait time to total epoch time
+            cpu_utilization=(timings.cpu_work_ms / epoch_latency) if epoch_latency > 0 else 0.0,
+            io_wait_utilization=(timings.io_wait_ms / epoch_latency) if epoch_latency > 0 else 0.0,
+            operator_epoch_stats=self._build_operator_epoch_stats(epoch_latency),
+            phase_resources=self.phase_resource_tracker.export(),
+            key_counts=sum(len(data) for data in self.local_state.data.values()),
         )
 
-        await self._sync_cleanup(worker_epoch_stats)
-        self._last_epoch_end_time = timer()
+    def _log_epoch_summary(self, stats: WorkerEpochStats) -> None:
+        logging.warning(f"Epoch throughput: {stats.epoch_throughput} | Latency: {stats.epoch_latency} ms")
+        logging.warning(f"Queue backlog: {len(self.sequencer.distributed_log)}")
+        if stats.total_txns > 0:
+            logging.warning(f"Per txn cost: {stats.epoch_latency / stats.total_txns} ms")
+        logging.debug(
+            f"{self.id} ||| Epoch: {self.sequencer.epoch_counter - 1} done in "
+            f"{stats.epoch_latency}ms "
+            f"global logic aborts: {len(self.networking.logic_aborts_everywhere)} "
+            f"concurrency aborts for next epoch: {len(self.concurrency_aborts_everywhere)} "
+            f"commited transactions: {stats.committed_txns} "
+            f"total transactions: {stats.total_txns} "
+            f"sequencer backlog: {len(self.sequencer.distributed_log)} "
+        )
 
     """
     When migration happens, the transactions that are in the backlog of the migration
@@ -898,7 +909,6 @@ class AriaProtocol(BaseTransactionalProtocol):
         self.phase_resource_tracker.end("1st Run")
 
         # Wait for chains to finish
-        logging.debug(f"{self.id} ||| Waiting on chained {len(self.networking.waited_ack_events)} functions...")
         self.phase_resource_tracker.begin("Chain Acks")
         start_chain = timer()
         await asyncio.gather(
@@ -906,7 +916,6 @@ class AriaProtocol(BaseTransactionalProtocol):
         )
         end_chain = timer()
         self.phase_resource_tracker.end("Chain Acks")
-        logging.debug("Finished waiting on chained functions")
 
         return {
             "wal_ms": (end_wal - start_wal) * 1000,
@@ -1027,7 +1036,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         )
         committed_fallback = 0
         if abort_rate > FALLBACK_STRATEGY_PERCENTAGE:
-            logging.warning(
+            logging.debug(
                 f"{self.id} ||| Epoch: {self.sequencer.epoch_counter} "
                 f"Abort percentage: {int(abort_rate * 100)}% initiating fallback strategy...",
             )
@@ -1035,13 +1044,8 @@ class AriaProtocol(BaseTransactionalProtocol):
             local_aborted_t_ids = self.sequencer.get_aborted_sequence(self.t_ids_to_reschedule)
             committed_fallback = len(local_aborted_t_ids)
 
-            logging.debug(
-                f"FALLBACK_ENTER to_reschedule={len(self.t_ids_to_reschedule)}",
-            )
             await self.run_fallback_strategy()
-            logging.debug("FALLBACK_AFTER_STRATEGY")
             await self.send_delta_to_snapshotting_proc()
-            logging.debug("FALLBACK_AFTER_DELTA")
             self.concurrency_aborts_everywhere = set()
             # Keep rescheduled t_ids (rw-set changed during fallback) for the next epoch
             self.t_ids_to_reschedule = self.fallback_rescheduled_t_ids.copy()
@@ -1063,7 +1067,6 @@ class AriaProtocol(BaseTransactionalProtocol):
                 self.topic_partition_offsets[tpo_key] = payload.kafka_offset
             else:
                 self.topic_partition_offsets[tpo_key] = max(payload.kafka_offset, prev)
-        logging.debug(f"Partition requests: {partition_reqs}")
 
     async def _sync_cleanup(
         self,
@@ -1184,14 +1187,12 @@ class AriaProtocol(BaseTransactionalProtocol):
                     sequenced_item.payload,
                 ),
             )
-        # logging.warning(f"Remote function calls: {self.networking.remote_function_calls}")
 
         await self.sync_workers(
             msg_type=MessageType.AriaFallbackStart,
             message=(self.id,),
             serializer=Serializer.MSGPACK,
         )
-        logging.debug("FALLBACK_SYNC_START_DONE")
         if fallback_tasks:
             await asyncio.gather(*fallback_tasks)
             # Flush all fallback egress sends in one batch (each root above
@@ -1208,7 +1209,6 @@ class AriaProtocol(BaseTransactionalProtocol):
             message=(self.id,),
             serializer=Serializer.MSGPACK,
         )
-        logging.debug("FALLBACK_SYNC_DONE_DONE")
 
     async def unlock_tid(self, t_id_to_unlock: int) -> None:
         if t_id_to_unlock in self.fallback_locking_event_map:

@@ -62,7 +62,7 @@ kill_at: int = int(sys.argv[13]) if len(sys.argv) > 13 else -1
 ####################################################################################################################
 g = StateflowGraph("ycsb-benchmark",
                    operator_state_backend=LocalStateBackend.DICT,
-                   max_operator_parallelism=N_PARTITIONS * 2 if autoscaling_enabled else N_PARTITIONS)
+                   max_operator_parallelism=N_PARTITIONS)
 ycsb_operator.set_n_partitions(N_PARTITIONS)
 g.add_operators(ycsb_operator)
 
@@ -184,7 +184,8 @@ def main():
         results = p.map(benchmark_runner, range(threads))
 
     results = {k: v for d in results for k, v in d.items()}
-    #assert len(results) == messages_per_second * seconds * threads
+    expected_per_thread = sum(load_schedule.get_tps(second) for second in range(seconds))
+    assert len(results) == expected_per_thread * threads    
 
     if run_with_validation:
         # wait for system to stabilize
@@ -245,7 +246,6 @@ if __name__ == "__main__":
 
     if autoscaling_enabled:
         migrations = tracker.stop()
-        print(f"Migrations: {migrations}")
     else:
         migrations = None
 

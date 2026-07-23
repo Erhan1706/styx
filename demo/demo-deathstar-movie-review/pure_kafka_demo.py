@@ -62,7 +62,7 @@ kill_at = int(sys.argv[10]) if len(sys.argv) > 10 else -1
 
 g = StateflowGraph("deathstar_movie_review",
                    operator_state_backend=LocalStateBackend.DICT,
-                   max_operator_parallelism=N_PARTITIONS if not autoscaling_enabled else N_PARTITIONS + 1)
+                   max_operator_parallelism=N_PARTITIONS)
 ####################################################################################################################
 compose_review_operator.set_n_partitions(N_PARTITIONS)
 movie_id_operator.set_n_partitions(N_PARTITIONS)
@@ -320,7 +320,6 @@ if __name__ == "__main__":
 
     if autoscaling_enabled:
         migrations = tracker.stop()
-        print(f"Migrations: {migrations}")
     else:
         migrations = None
 

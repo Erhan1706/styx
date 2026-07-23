@@ -56,7 +56,7 @@ if not os.path.exists(SAVE_DIR):
 
 g = StateflowGraph("deathstar_hotel_reservations",
                    operator_state_backend=LocalStateBackend.DICT,
-                   max_operator_parallelism=N_PARTITIONS if not autoscaling_enabled else N_PARTITIONS + 1)
+                   max_operator_parallelism=N_PARTITIONS)
 ####################################################################################################################
 flight_operator.set_n_partitions(N_PARTITIONS)
 geo_operator.set_n_partitions(N_PARTITIONS)
@@ -193,11 +193,11 @@ def populate_with_init_data(styx: SyncStyxClient):
     init_partitioned(styx, user_operator, user_items)
 
     # HOTEL: ctx.put({"Cap": cap, "Customers": []})
-    hotel_items = [(i, {"Cap": 1000, "Customers": []}) for i in range(100)]
+    hotel_items = [(i, {"Cap": 10, "Customers": []}) for i in range(100)]
     init_partitioned(styx, hotel_operator, hotel_items)
 
     # FLIGHT: ctx.put({"Cap": cap, "Customers": []})
-    flight_items = [(i, {"Cap": 1000, "Customers": []}) for i in range(100)]
+    flight_items = [(i, {"Cap": 10, "Customers": []}) for i in range(100)]
     init_partitioned(styx, flight_operator, flight_items)
 
 
@@ -228,7 +228,7 @@ def _request_key(proc_num: int, local_id: int) -> int:
 
 
 # -------------------------------------------------------------------------------------
-# Workload generation
+# Workload generation (unchanged)
 # -------------------------------------------------------------------------------------
 
 def search_hotel(c):
@@ -305,7 +305,6 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
     styx.open(consume=False)
     deathstar_generator = deathstar_workload_generator(proc_num)
     timestamp_futures: dict[bytes, dict] = {}
-    time.sleep(5)
     barrier.wait()
     start = timer()
     for second in range(seconds):
@@ -394,7 +393,6 @@ if __name__ == "__main__":
 
     if autoscaling_enabled:
         migrations = tracker.stop()
-        print(f"Migrations: {migrations}")
     else:
         migrations = None
 

@@ -237,7 +237,7 @@ class SocketPool:
             success = await client.create_connection(self.host, self.port)
             if success:
                 self.conns.append(client)
-        logging.warning(f"SOCKET | Created {len(self.conns)} connections to {self.host}:{self.port}")
+        logging.debug(f"SOCKET | Created {len(self.conns)} connections to {self.host}:{self.port}")
 
     async def close(self) -> None:
         for conn in self.conns:

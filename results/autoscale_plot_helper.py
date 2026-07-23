@@ -6,21 +6,24 @@ import matplotlib.pyplot as plt
 import os
 
 from matplotlib.lines import Line2D
-from plot_latency import plot_latency
-from plot_throughput import plot_throughput
-from plot_workers import plot_backlog, plot_workers
+from autoscale_plot_latency import plot_latency
+from autoscale_plot_throughput import plot_throughput
+from autoscale_plot_workers import plot_backlog, plot_workers
 
 RESULTS_DIR = Path(__file__).resolve().parent
 
 
-def find_runs_by_keyword(keywords: List[str]) -> List[Path]:
+def find_runs_by_keyword(
+    keywords: List[str],
+    results_dir: Path = RESULTS_DIR,
+) -> List[Path]:
     keywords = [keyword.lower() for keyword in keywords]
     runs: List[Path] = []
-    if not RESULTS_DIR.is_dir():
-        print(f"Results directory not found: {RESULTS_DIR}")
+    if not results_dir.is_dir():
+        print(f"Results directory not found: {results_dir}")
         return runs
 
-    for child in sorted(RESULTS_DIR.iterdir()):
+    for child in sorted(results_dir.iterdir()):
         if not child.is_dir():
             continue
         # Basic matching: directory name contains the keyword (e.g. "ycsb", "dhr")
@@ -95,9 +98,16 @@ def main() -> None:
         default=None,
         help="Name of the combined plot",
     )
+    parser.add_argument(
+        "-d", "--results-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Directory containing run subdirectories (default: results/)",
+    )
     args = parser.parse_args()
+    results_dir = args.results_dir.resolve()
 
-    runs = find_runs_by_keyword(args.workload)
+    runs = find_runs_by_keyword(args.workload, results_dir=results_dir)
     if args.combined_name:
         output_name = f"{args.combined_name}.pdf"
     else:
@@ -158,12 +168,10 @@ def main() -> None:
         )
         fig.subplots_adjust(top=0.96)
         fig.savefig(
-            os.path.join(RESULTS_DIR, output_name),
+            os.path.join(results_dir, output_name),
             bbox_inches="tight",
             pad_inches=0.05,
         )
-        #combined_path = selected / args.combined_name
-        #fig.savefig(combined_path)
         plt.show()
 
 

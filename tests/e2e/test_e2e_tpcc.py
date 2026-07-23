@@ -1,12 +1,19 @@
 from dataclasses import dataclass
 import json
 import logging
+import math
 from pathlib import Path
 import shutil
 
 import pytest
 
-from tests.helpers import make_test_env, run_and_stream, wait_port
+from tests.helpers import (
+    make_test_env,
+    resolve_run_dir,
+    run_and_stream,
+    wait_for_workers,
+    wait_port,
+)
 
 log = logging.getLogger("e2e.tpcc")
 
@@ -113,9 +120,10 @@ def _client_cmd(results_dir: Path, cluster: _ClusterParams, client: _ClientParam
     #  6  warmup_seconds
     #  7  N_W
     #  8  enable_compression
-    #  9  use_composite_keys
-    # 10  load_config_path
-    # 11  kill_at (optional; default -1)
+    # 10  epoch_size
+    # 11  load_config_path
+    # 12  autoscaling_enabled
+    # 13  kill_at
     return [
         "python",
         "pure_kafka_demo.py",
@@ -128,7 +136,9 @@ def _client_cmd(results_dir: Path, cluster: _ClusterParams, client: _ClientParam
         str(client.n_warehouses),
         cluster.enable_compression,
         cluster.use_composite_keys,
+        str(cluster.epoch_size),
         "../load_profiles/constant.yaml",
+        "false",
         str(client.kill_at),
     ]
 
@@ -152,6 +162,10 @@ def _start_cluster_and_wait(paths: _Paths, env: dict, cluster: _ClusterParams) -
     log.info("Waiting for Styx coordinator published port (127.0.0.1:8886)...")
     wait_port("127.0.0.1", 8886, timeout_s=240)
     log.info("Coordinator port is up.")
+
+    n_workers = max(1, math.ceil(cluster.n_partitions / cluster.threads_per_worker))
+    log.info("Waiting for %s worker(s) to register with the coordinator...", n_workers)
+    wait_for_workers(n_workers, log=log)
 
 
 def _ensure_tpcc_dataset(paths: _Paths, env: dict, *, n_keys: int, regenerate_tpcc_data: bool) -> None:
@@ -239,14 +253,15 @@ def _run_client(
 
 
 def _assert_artifacts_and_metrics(results_dir: Path, client: _ClientParams) -> None:
-    client_csv = results_dir / "client_requests.csv"
-    output_csv = results_dir / "output.csv"
+    run_dir = resolve_run_dir(results_dir)
+    client_csv = run_dir / "client_requests.csv"
+    output_csv = run_dir / "output.csv"
     log.info("Checking artifacts: %s and %s", client_csv, output_csv)
 
     assert client_csv.exists(), f"Missing artifact: {client_csv}"
     assert output_csv.exists(), f"Missing artifact: {output_csv}"
 
-    _assert_metrics(results_dir=results_dir, input_rate=client.input_rate, client_threads=client.client_threads)
+    _assert_metrics(results_dir=run_dir, input_rate=client.input_rate, client_threads=client.client_threads)
 
 
 def _stop_cluster(paths: _Paths, env: dict, cluster: _ClusterParams, *, timeout_s: int) -> None:

@@ -75,6 +75,7 @@ def plot_latency(
     ax.grid(linestyle="dotted", linewidth=1.5, axis="y")
     ax.set_ylabel("E2E Latency (ms)")
     ax.yaxis.set_major_formatter(EngFormatter(sep=""))
+    ax.tick_params(axis='both', labelsize=24)
 
     plot_migrations(ax, migrations, t0, warmup_seconds)
 

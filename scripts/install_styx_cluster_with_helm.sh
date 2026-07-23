@@ -17,9 +17,7 @@ fi
 echo "Updating chart dependencies..."
 helm dependency update "$ROOT_DIR/charts/styx-cluster"
 
-# Optional experiment overrides (set by run_autoscale_experiment.sh or manually):
-#   STYX_WORKER_REPLICAS, STYX_STANDBY_REPLICAS, STYX_WORKER_THREADS,
-#   STYX_ENABLE_AUTOSCALE, STYX_FORECASTER_TYPE
+# Optional experiment overrides:
 HELM_SET_ARGS=()
 if [[ -n "${STYX_WORKER_REPLICAS:-}" ]]; then
   HELM_SET_ARGS+=(--set "styx.worker.replicas=${STYX_WORKER_REPLICAS}")

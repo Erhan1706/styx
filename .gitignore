@@ -155,11 +155,9 @@ grafana-enterprise-11.5.1.darwin-amd64.tar.gz
 
 !grafana/dashboards/styx.json
 !grafana/dashboards/server_specific.json
-grafana_data/
 ycsb_dataset_*
-prometheus-data/
 results/*
-!results/plot*
+!results/*plot*
 models/*
 !models/.gitkeep
 

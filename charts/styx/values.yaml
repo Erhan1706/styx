@@ -10,7 +10,7 @@ coordinator:
   image:
     repository: ghcr.io/delftdata/styx-coordinator
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   replicas: 1
   ports:
     discovery: 8888
@@ -29,7 +29,7 @@ worker:
   image:
     repository: ghcr.io/delftdata/styx-worker
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   env:
     INGRESS_TYPE: KAFKA
     WORKER_THREADS: "1"

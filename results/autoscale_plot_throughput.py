@@ -7,7 +7,7 @@ from matplotlib.ticker import EngFormatter, MultipleLocator
 
 from plot_common import load_metadata, plot_migrations
 
-plt.rcParams.update({"font.size": 16})
+plt.rcParams.update({"font.size": 20})
 
 _SAVEFIG_KW = {"bbox_inches": "tight", "pad_inches": 0.05}
 
@@ -19,6 +19,10 @@ def _throughput_tick_step(max_tps: float) -> float:
         return 100
     if max_tps <= 10000:
         return 2000
+    if max_tps >= 50000:
+        return 10000
+    if max_tps >= 70000:
+        return 15000
     return 5000
 
 
@@ -116,6 +120,7 @@ def plot_throughput(
     ax.set_ylabel("Throughput (TPS)")
     ax.yaxis.set_major_formatter(EngFormatter(sep=""))
     ax.grid(linestyle="dotted", linewidth=1.5, axis="y")
+    ax.tick_params(axis='both', labelsize=24)
 
     max_in = float(throughput_df["throughput_in"].max()) if not throughput_df.empty else 0.0
     max_out = float(throughput_df["throughput_out"].max()) if not throughput_df.empty else 0.0

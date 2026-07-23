@@ -131,35 +131,6 @@ class InMemoryOperatorState(BaseAriaState):
             c += len(keys)
         return c
 
-    def log_state_summary(self, worker_id: int, context: str = "") -> None:
-        """
-        Log a detailed summary of the current state for debugging migration.
-        """
-        logging.warning(f"===== STATE SUMMARY (Worker {worker_id}) {context} =====")
-        logging.warning(f"  Operator Partitions: {list(self.operator_partitions)}")
-
-        # Log keys per partition
-        for op_partition, kv_pairs in self.data.items():
-            key_count = len(kv_pairs)
-            logging.warning(f"  Partition {op_partition}: {key_count} keys")
-
-        # Log migration state
-        if self.keys_to_send:
-            logging.warning("  Keys to send (migration outgoing):")
-            for op_partition, keys in self.keys_to_send.items():
-                logging.warning(f"    {op_partition}: {len(keys)} keys pending")
-        else:
-            logging.warning("  Keys to send: EMPTY (no outgoing migration)")
-
-        if self.remote_keys:
-            logging.warning("  Remote keys (migration incoming - waiting):")
-            for op_partition, keys in self.remote_keys.items():
-                logging.warning(f"    {op_partition}: {len(keys)} keys expected from remote")
-        else:
-            logging.warning("  Remote keys: EMPTY (no pending incoming)")
-
-        logging.warning("===== END STATE SUMMARY =====")
-
     def get_async_migrate_batch(self, batch_size: int) -> dict[OperatorPartition, KVPairs]:
         batch_to_send: dict[OperatorPartition, KVPairs] = defaultdict(dict)
         c = 0
@@ -197,7 +168,6 @@ class InMemoryOperatorState(BaseAriaState):
 
     def set_batch_data_from_migration(self, operator_partition: OperatorPartition, kv_pairs: KVPairs) -> None:
         operator_partition = tuple(operator_partition)  # new partitioning
-        # Ensure the operator partition is initialized (defensive check for race conditions)
         if operator_partition not in self.data:
             self.add_new_operator_partition(operator_partition)
         self.data[operator_partition].update(kv_pairs)
@@ -253,19 +223,6 @@ class InMemoryOperatorState(BaseAriaState):
             self.global_write_sets[operator_partition] = {}
             self.global_reads[operator_partition] = {}
             self.global_read_sets[operator_partition] = {}
-
-    def discard_remote_key(self, operator_partition: OperatorPartition, key: K) -> None:
-        """Drop a pending incoming-migration entry for a key.
-
-        Called when the source worker reports it no longer holds the key (a None
-        on-demand response). The key is treated as absent locally so the waiting
-        transaction can proceed and the key is not re-requested every epoch.
-        """
-        operator_partition = tuple(operator_partition)
-        if operator_partition in self.remote_keys:
-            self.remote_keys[operator_partition].pop(key, None)
-            if not self.remote_keys[operator_partition]:
-                del self.remote_keys[operator_partition]
 
     def add_remote_keys(
         self,

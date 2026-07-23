@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 import json
 import logging
+import math
 from pathlib import Path
 import shutil
 
 import pytest
 
-from tests.helpers import make_test_env, run_and_stream, wait_port
+from tests.helpers import make_test_env, run_and_stream, wait_for_workers, wait_port
 
 log = logging.getLogger("e2e.migration_tpcc")
 
@@ -152,6 +153,10 @@ def _start_cluster_and_wait(paths: _Paths, env: dict, cluster: _ClusterParams) -
     log.info("Waiting for Styx coordinator published port (127.0.0.1:8886)...")
     wait_port("127.0.0.1", 8886, timeout_s=240)
     log.info("Coordinator port is up.")
+
+    n_workers = max(1, math.ceil(cluster.n_partitions / cluster.threads_per_worker))
+    log.info("Waiting for %s worker(s) to register with the coordinator...", n_workers)
+    wait_for_workers(n_workers, log=log)
 
 
 def _ensure_tpcc_dataset(paths: _Paths, env: dict, *, n_warehouses: int, regenerate: bool) -> None:

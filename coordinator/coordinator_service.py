@@ -40,8 +40,6 @@ import uvloop
 from coordinator.migration_metadata import MigrationMetadata
 
 if TYPE_CHECKING:
-    # Imported lazily at runtime (only when autoscaling is enabled) to avoid
-    # pulling in chronos/torch/pandas in non-autoscale builds.
     from autoscaler.chronos_forecaster import ChronosForecaster
     from styx.common.stateflow_graph import StateflowGraph
 
@@ -172,7 +170,6 @@ class CoordinatorService:
         self.snapshotting_gauge = Gauge("worker_total_snapshotting_time_ms", "Snapshotting time (ms)", ["instance"])
         self.heartbeat_gauge = Gauge("time_since_last_heartbeat", "Time Since Last Heartbeat", ["instance"])
         self.queue_backlog_gauge = Gauge("queue_backlog", "Backlog in the worker queue", ["instance"])
-        self.idle_time_ms_gauge = Gauge("idle_time_ms_per_second", "Idle time ms per second", ["instance"])
 
         self.input_rate_counter = Counter("input_rate_counter", "Input rate", ["instance"])
         # Transaction count metrics
@@ -195,10 +192,6 @@ class CoordinatorService:
             "epoch_committed_fallback", "Transactions committed in fallback phase (cumulative)", ["instance"]
         )
         # Metrics for downscaling policies
-        self.empty_epoch_gauge = Gauge(
-            "worker_empty_epoch", "1 if epoch had no local work (just sync), 0 otherwise", ["instance"]
-        )
-
         self.cpu_utilization_ratio_gauge = Gauge(
             "worker_cpu_utilization", "Ratio of CPU work in the epoch", ["instance"]
         )
@@ -368,7 +361,7 @@ class CoordinatorService:
         new_graph = deepcopy(self.coordinator.submitted_graph)
         new_graph.max_operator_parallelism = effective_n_partitions
         for _op_name, op in iter(new_graph):
-            # Scale all operators uniformly for now (fits YCSB demo; can be extended per-operator later)
+            # Scale all operators uniformly for now (can be extended per-operator later)
             if hasattr(op, "set_n_partitions"):
                 op.set_n_partitions(effective_n_partitions)
             else:
@@ -619,8 +612,8 @@ class CoordinatorService:
     async def _handle_migration_ready_to_start(
         self,
         _: StreamWriter,
-        data: bytes,
-        __: concurrent.futures.ProcessPoolExecutor,
+        __: bytes,
+        ___: concurrent.futures.ProcessPoolExecutor,
     ) -> None:
         """
         Each participating worker reports here once it has finished Phase B
@@ -631,16 +624,11 @@ class CoordinatorService:
         """
         mt = MessageType.MigrationReadyToStart
         async with self.networking_locks[mt]:
-            (worker_id,) = self.networking.decode_message(data)
             sync_complete: bool = await self.migration_metadata.set_empty_sync_done(mt)
-            logging.warning(
-                f"MIGRATION | MigrationReadyToStart | worker {worker_id} | "
-                f"{self.migration_metadata.sync_sum[mt]}/{self.migration_metadata.n_workers}",
-            )
             if not sync_complete:
                 return
 
-            logging.warning("MIGRATION | MigrationReadyToStart | all workers ready, releasing")
+            logging.debug("MigrationReadyToStart | all workers ready, releasing")
             await self.finalize_migration_ready_to_start()
             await self.migration_metadata.cleanup(mt)
 
@@ -742,9 +730,9 @@ class CoordinatorService:
             self.network_tx_gauge.labels(instance=worker_id).set(tx_net)  # KB
 
             heartbeat_rcv_time = timer()
-            # logging.info(
-            #    f"Heartbeat received from: {worker_id} at time: {heartbeat_rcv_time}",
-            # )
+            logging.info(
+                f"Heartbeat received from: {worker_id} at time: {heartbeat_rcv_time}",
+            )
 
             self.coordinator.register_worker_heartbeat(worker_id, heartbeat_rcv_time)
 
@@ -867,14 +855,12 @@ class CoordinatorService:
                 snap_time,
                 input_rate,
                 queue_backlog,
-                idle_time_ms,
                 total_txns,
                 committed_txns,
                 logic_aborts,
                 concurrency_aborts,
                 committed_lock_free,
                 committed_fallback,
-                empty_epoch,
                 cpu_utilization,
                 io_wait_utilization,
                 operator_epoch_stats,
@@ -897,14 +883,12 @@ class CoordinatorService:
                 snap_time=snap_time,
                 input_rate=input_rate,
                 queue_backlog=queue_backlog,
-                idle_time_ms=idle_time_ms,
                 total_txns=total_txns,
                 committed_txns=committed_txns,
                 logic_aborts=logic_aborts,
                 concurrency_aborts=concurrency_aborts,
                 committed_lock_free=committed_lock_free,
                 committed_fallback=committed_fallback,
-                empty_epoch=empty_epoch,
                 cpu_utilization=cpu_utilization,
                 io_wait_utilization=io_wait_utilization,
                 operator_epoch_stats=operator_epoch_stats,
@@ -1061,7 +1045,6 @@ class CoordinatorService:
 
         self.input_rate_counter.labels(instance=worker_id).inc(worker_epoch_stats.input_rate)
         self.queue_backlog_gauge.labels(instance=worker_id).set(worker_epoch_stats.queue_backlog)
-        self.idle_time_ms_gauge.labels(instance=worker_id).set(worker_epoch_stats.idle_time_ms)
 
         # Transaction count metrics
         self.epoch_total_txns_counter.labels(instance=worker_id).inc(worker_epoch_stats.total_txns)
@@ -1072,7 +1055,6 @@ class CoordinatorService:
         self.epoch_committed_fallback_counter.labels(instance=worker_id).inc(worker_epoch_stats.committed_fallback)
 
         # Downscaling metrics
-        self.empty_epoch_gauge.labels(instance=worker_id).set(1 if worker_epoch_stats.empty_epoch else 0)
         self.cpu_utilization_ratio_gauge.labels(instance=worker_id).set(worker_epoch_stats.cpu_utilization)
         self.io_utilization_ratio_gauge.labels(instance=worker_id).set(worker_epoch_stats.io_wait_utilization)
 
@@ -1127,9 +1109,6 @@ class CoordinatorService:
         mt = MessageType.MigrationDone
         async with self.networking_locks[mt]:
             sync_complete: bool = await self.migration_metadata.set_empty_sync_done(mt)
-            logging.warning(
-                f"MIGRATION | MigrationDone | {self.migration_metadata.sync_sum}",
-            )
             if not sync_complete:
                 return
 
@@ -1254,7 +1233,6 @@ class CoordinatorService:
     async def finalize_migration(self) -> None:
         async with asyncio.TaskGroup() as tg:
             for worker in self._migration_workers():
-                logging.warning(f"Sending MigrationDone to : {worker}")
                 tg.create_task(
                     self.networking.send_message(
                         worker.worker_ip,
@@ -1273,7 +1251,6 @@ class CoordinatorService:
     async def finalize_migration_ready_to_start(self) -> None:
         async with asyncio.TaskGroup() as tg:
             for worker in self._migration_workers():
-                logging.warning(f"Sending MigrationReadyToStart to : {worker}")
                 tg.create_task(
                     self.networking.send_message(
                         worker.worker_ip,
@@ -1498,14 +1475,23 @@ class CoordinatorService:
         logging.warning("Coordinator Snapshotting online")
 
         if self.enable_autoscale:
-            from autoscaler.chronos_forecaster import ChronosForecaster
-
-            self.chronos_forecaster = ChronosForecaster()
-            self.chronos_forecaster.start()
             self.forecaster_task = asyncio.create_task(self.chronos_forecast_loop())
-            logging.warning("Chronos forecaster online (interval=%.1fs)", CHRONOS_FORECAST_INTERVAL)
+            self.aio_task_scheduler_coord.create_unbounded_task(self._boot_chronos_forecaster())
 
         await self.tcp_service()
+
+    async def _boot_chronos_forecaster(self) -> None:
+        # Only import heavy torch dependencies on demand
+        def _build() -> ChronosForecaster:
+            from autoscaler.chronos_forecaster import ChronosForecaster
+
+            forecaster = ChronosForecaster()
+            forecaster.start()
+            return forecaster
+
+        # Run in a worker thread: the import and process spawn are both blocking.
+        self.chronos_forecaster = await asyncio.to_thread(_build)
+        logging.warning("Chronos forecaster online (interval=%.1fs)", CHRONOS_FORECAST_INTERVAL)
 
 
 if __name__ == "__main__":

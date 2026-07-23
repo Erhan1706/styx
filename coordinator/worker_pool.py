@@ -74,9 +74,7 @@ class WorkerPool:
     def reset_all_assignments(self) -> None:
         """
         Clears all operator assignments and rebuilds the priority queue.
-
-        This is useful for manual rebalance (e.g., after scaling up), where we want to
-        redistribute partitions across *all* live workers.
+        Used when scaling, where we want to redistribute partitions across all live workers.
         """
         # Make the live workers list deterministic by sorting by worker_id
         live_workers = sorted(self.get_live_workers(), key=lambda w: w.worker_id)

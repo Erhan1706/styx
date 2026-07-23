@@ -401,7 +401,7 @@ class Worker:
             peers,
             self.operator_state_backend,
         ) = self.networking.decode_message(data)
-        logging.warning(
+        logging.debug(
             f"MIGRATION | RECEIVED THE DNS: {self.dns} and the peers: {peers} "
             f"and the new worker operators: {new_worker_operators} "
             f"with keys: {new_worker_operators.keys()}",
@@ -435,7 +435,6 @@ class Worker:
         ) = self.networking.decode_message(self._pending_migration_data)
 
         operator_partitions_to_repartition = self.local_state.get_operator_partitions_to_repartition()
-        logging.warning(f"MIGRATION | OPERATOR PARTITIONS TO REPARTITION: {operator_partitions_to_repartition}")
         self.total_repartitioning = sum(len(parts) for parts in operator_partitions_to_repartition.values())
 
         if self.total_repartitioning == 0:
@@ -508,11 +507,9 @@ class Worker:
 
     async def _migration_register_whole_partition_transfers(self) -> None:
         """Register keys whose partition number didn't change but whose owner did.
-
         rehash_only / catch-up only flag keys where new_partition != old_partition.
-        When a partition moves to a different worker (e.g. partition 0 goes from
-        this worker to a standby), all keys that still hash to that same partition
-        number are missed.
+        When a partition stays the same but the worker changes (e.g. partition 0 moves
+        from worker 1 to 2), all keys that still hash to that same partition number are missed.
         """
         new_assignments: set[OperatorPartition] = set(self.worker_operators.keys())
         for op_partition in list(self.local_state.data.keys()):
@@ -520,14 +517,10 @@ class Worker:
                 continue
             operator_name, old_partition = op_partition
             new_owner = self.dns.get(operator_name, {}).get(old_partition)
-            if new_owner is None:
-                continue
             keys_in_partition = self.local_state.data[op_partition]
-            if not keys_in_partition:
-                continue
             already_tracked = {k for k, _ in self.final_keys_to_send.get(op_partition, set())}
             untracked_keys = set(keys_in_partition.keys()) - already_tracked
-            if not untracked_keys:
+            if not keys_in_partition or new_owner is None or not untracked_keys:
                 continue
             logging.warning(
                 f"MIGRATION | Whole-partition transfer: {op_partition} → "
@@ -706,7 +699,6 @@ class Worker:
             # 2. Decode and apply the plan (dns, peers, worker_operators)
             await self._migration_decode_and_apply_plan(self._pending_migration_data)
 
-            self.local_state.log_state_summary(self.id, context="MIGRATION (post-repartition)")
             self._pending_migration_data = None
 
             # 3. Catch-up pass: find keys created during Phase A that weren't rehashed
@@ -733,7 +725,6 @@ class Worker:
             )
 
             # 6. Send MigrationInitDone with actual stop-time counters.
-            #    Standby workers have no running protocol — report sentinel counters.
             if standby:
                 epoch_counter = self.m_epoch_counter
                 t_counter = self.m_t_counter
@@ -829,7 +820,6 @@ class Worker:
             self.m_input_offsets,
             self.m_output_offsets,
         ) = self.networking.decode_message(data)
-        logging.warning("MIGRATION REPARTITIONING DONE RECEIVED")
         self.migration_completed.set()
         await asyncio.sleep(0)
 

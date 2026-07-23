@@ -17,14 +17,12 @@ class WorkerEpochStats:
     snap_time: float
     input_rate: float
     queue_backlog: float
-    idle_time_ms: float
     total_txns: int
     committed_txns: int
     logic_aborts: int
     concurrency_aborts: int
     committed_lock_free: int
     committed_fallback: int
-    empty_epoch: bool
     cpu_utilization: float
     io_wait_utilization: float
     operator_epoch_stats: list[tuple[str, int, float, float, int]]

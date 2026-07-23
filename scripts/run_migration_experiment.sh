@@ -29,9 +29,6 @@ n_keys=${10}
 [ -n "${14:-}" ] && use_composite_keys=${14}
 autoscaling_enabled="false"
 
-docker compose logs worker | sort -t '|' -k1,1 -k2,2 > worker-logs.log
-docker compose logs coordinator > coordinator-logs.log
-docker compose logs worker-standby | sort -t '|' -k1,1 -k2,2 > worker-standby-logs.log
 # Determine the maximum number of partitions
 if (( start_n_part > end_n_part )); then
     max_part=$start_n_part

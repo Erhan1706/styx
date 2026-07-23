@@ -56,14 +56,6 @@ class StyxKafkaIngress(BaseIngress):
             "forwarded_wrong_partition": 0,  # Forwarded via TCP as WrongPartitionRequest
         }
 
-    def log_epoch_stats(self, epoch: int, stats: dict[str, int]) -> None:
-        logging.debug(
-            f"INGRESS | epoch={epoch} "
-            f"consumed={stats.get('consumed', 0)} "
-            f"sequenced={stats.get('sequenced', 0)} "
-            f"forwarded_wrong_partition={stats.get('forwarded_wrong_partition', 0)}"
-        )
-
     async def start(
         self, topic_partitions: list[TopicPartition], topic_partition_offsets: dict[OperatorPartition, int]
     ) -> None:
@@ -83,7 +75,6 @@ class StyxKafkaIngress(BaseIngress):
     def handle_message_from_kafka(self, msg: ConsumerRecord) -> None:
         current_epoch = self.sequencer.epoch_counter
         if current_epoch != self._ingress_epoch:
-            self.log_epoch_stats(self._ingress_epoch, self.epoch_stats)
             self.epoch_stats = {
                 "consumed": 0,
                 "sequenced": 0,
@@ -91,10 +82,6 @@ class StyxKafkaIngress(BaseIngress):
             }
             self._ingress_epoch = current_epoch
 
-        # logging.info(
-        #     f"Consumed: {msg.topic} {msg.partition} {msg.offset} "
-        #     f"{msg.key} {msg.value} {msg.timestamp}"
-        # )
         message_type: int = self.networking.get_msg_type(msg.value)
         if message_type == MessageType.ClientMsg:
             self.epoch_stats["consumed"] += 1

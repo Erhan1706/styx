@@ -21,7 +21,7 @@ async def create(ctx: StatefulFunction, cap: int):
 @flight_operator.register
 async def reserve(ctx: StatefulFunction):
     flight_data = ctx.get()
-    flight_data['Cap'] -= 1
+    # flight_data['Cap'] -= 1
     if flight_data["Cap"] < 0:
         raise NotEnoughSpace(f"Not enough space: for flight: {ctx.key}")
     ctx.put(flight_data)

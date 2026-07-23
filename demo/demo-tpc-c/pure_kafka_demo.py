@@ -81,7 +81,7 @@ use_composite_keys: bool = bool(strtobool(sys.argv[9]))
 os.environ["ENABLE_COMPRESSION"] = str(enable_compression)
 os.environ["USE_COMPOSITE_KEYS"] = str(use_composite_keys)
 autoscaling_enabled: bool = sys.argv[12].lower() == "true"
-kill_at = int(sys.argv[13]) if len(sys.argv) > 14 else -1
+kill_at = int(sys.argv[13]) if len(sys.argv) > 13 else -1
 
 
 customers_per_district: dict[tuple, list] = {}
@@ -98,7 +98,7 @@ Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
 g = StateflowGraph("tpcc_benchmark",
                    operator_state_backend=LocalStateBackend.DICT,
-                   max_operator_parallelism=N_PARTITIONS if not autoscaling_enabled else N_PARTITIONS + 1)
+                   max_operator_parallelism=N_PARTITIONS)
 ####################################################################################################################
 customer_operator.set_n_partitions(N_PARTITIONS)
 district_operator.set_n_partitions(N_PARTITIONS)
@@ -517,7 +517,6 @@ if __name__ == "__main__":
 
     if autoscaling_enabled:
         migrations = tracker.stop()
-        print(f"Migrations: {migrations}")
     else:
         migrations = None
 
